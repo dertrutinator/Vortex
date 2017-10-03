@@ -85,9 +85,11 @@ function importMods(api: types.IExtensionApi,
                   trace.log('error', 'Failed to import mod archive', failedArchive);
                   errors.push(mod.modFilename);
                 } else {
+                  return fs.statAsync(archiveDownloadPath)
                   .then(stats => {
                     api.store.dispatch(actions.addLocalDownload(
                       mod.vortexId, gameId, archiveDownloadPath, stats.size));
+                  });
                 }
 
               });
