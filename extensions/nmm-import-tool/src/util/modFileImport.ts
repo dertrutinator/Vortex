@@ -14,7 +14,7 @@ export function transferArchive(modArchivePath: string,
                                 destSavePath: string): Promise<string> {
   let failedArchive: string = null;
 
-  return fs.copyAsync(modArchivePath, path.join(destSavePath, path.basename(modArchivePath)))
+  return fs.copyAsync(modArchivePath, destSavePath)
   .catch(err => {
     failedArchive = modArchivePath + ' - ' + err.message;
   })

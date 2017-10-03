@@ -65,6 +65,7 @@ function importMods(api: types.IExtensionApi,
       trace.log('info', 'transfer unpacked mods files');
       const installPath = selectors.installPath(state);
       const downloadPath = selectors.downloadPath(state);
+      const gameId = selectors.activeGameId(state);
       return Promise.map(mods, mod => enhance(modsPath, mod))
       .then(modsEx => Promise.mapSeries(modsEx, (mod, idx) => {
         trace.log('info', 'transferring', mod);
@@ -76,19 +77,25 @@ function importMods(api: types.IExtensionApi,
             errors.push(mod.modName);
           }
           if (transferArchives) {
-            return transferArchive(path.join(mod.archivePath, mod.modFilename), downloadPath)
+            const archiveDownloadPath = path.join(downloadPath, mod.modFilename);
+            const sourceModPath = path.join(mod.archivePath, mod.modFilename);
+            return transferArchive(sourceModPath, archiveDownloadPath)
               .then(failedArchive => {
                 if (failedArchive !== null) {
                   trace.log('error', 'Failed to import mod archive', failedArchive);
                   errors.push(mod.modFilename);
+                } else {
+                  .then(stats => {
+                    api.store.dispatch(actions.addLocalDownload(
+                      mod.vortexId, gameId, archiveDownloadPath, stats.size));
                 }
+
               });
           }
         });
       })
         .then(() => {
           trace.log('info', 'Finished transferring unpacked mod files');
-          const gameId = selectors.activeGameId(state);
           const profileId = shortid();
           createProfile(gameId, profileId, 'Imported NMM Profile', api.store.dispatch);
           addMods(gameId, profileId, modsEx, api.store.dispatch);
