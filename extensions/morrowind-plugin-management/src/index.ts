@@ -8,8 +8,11 @@ import IniParser, { WinapiFormat } from 'vortex-parse-ini';
 
 let watcher: fs.FSWatcher;
 let refresher: util.Debouncer;
-let knownPlugins: string[] = util.makeReactive([]);
-let pluginOrder: string[] = util.makeReactive([]);
+
+let reactive = util.makeReactive({
+  knownPlugins: [],
+  pluginOrder: [],
+});
 
 function onFileChanged(event: string, fileName: string) {
   if (event === 'rename') {
@@ -54,8 +57,20 @@ function updatePluginOrder(iniFilePath: string, plugins: string[]) {
         prev[`GameFile${idx}`] = plugin;
         return prev;
       }, {});
-      parser.write(iniFilePath, ini);
+      return parser.write(iniFilePath, ini);
     });
+}
+
+function updatePluginTimestamps(dataPath: string, plugins: string[]): Promise<void> {
+  const offset = 946684800;
+  const oneDay = 24 * 60 * 60;
+  return Promise.mapSeries(plugins, (fileName, idx) => {
+    const mtime = offset + oneDay * idx;
+    return fs.utimesAsync(path.join(dataPath, fileName), mtime, mtime)
+      .catch(err => err.code === 'ENOENT'
+        ? Promise.resolve()
+        : Promise.reject(err));
+  }).then(() => undefined);
 }
 
 function refreshPlugins(api: types.IExtensionApi): Promise<void> {
@@ -72,8 +87,8 @@ function refreshPlugins(api: types.IExtensionApi): Promise<void> {
       readGameFiles(path.join(discovery.path, 'Morrowind.ini'))
         .then(gameFiles => ({ plugins, gameFiles })))
     .then(result => {
-      knownPlugins = result.plugins;
-      pluginOrder = result.gameFiles;
+      reactive.knownPlugins = result.plugins;
+      reactive.pluginOrder = result.gameFiles;
     });
 }
 
@@ -84,13 +99,17 @@ function init(context: types.IExtensionContext) {
     group: 'per-game',
     visible: () => selectors.activeGameId(context.api.store.getState()) === 'morrowind',
     props: () => ({
-      knownPlugins,
-      pluginOrder,
+      localState: reactive,
       onSetPluginOrder: (plugins: string[]) => {
         const state = context.api.store.getState();
+        reactive.pluginOrder = plugins;
         const discovery = state.settings.gameMode.discovered['morrowind'];
         const iniFilePath = path.join(discovery.path, 'Morrowind.ini');
-        updatePluginOrder(iniFilePath, plugins);
+        updatePluginOrder(iniFilePath, plugins)
+          .then(() => updatePluginTimestamps(path.join(discovery.path, 'Data Files'), plugins))
+          .catch(err => {
+            context.api.showErrorNotification('Failed to update morrowind.ini', err, { allowReport: false });
+          });
       },
     }),
   });

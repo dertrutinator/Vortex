@@ -6,9 +6,18 @@
     "fa": "Font-Awesome-SVG-PNG-master/black/svg"
   },
   "icons": {
-    "window-minimize": "{fa}/window-minimize",
-    "window-restore": "{fa}/window-restore",
-    "window-maximize": "{fa}/window-maximize",
+    "window-minimize": {
+      "path": "{fa}/window-minimize",
+      "scaleStroke": false
+    },
+    "window-restore": {
+      "path": "{fa}/window-restore",
+      "scaleStroke": false
+    },
+    "window-maximize": {
+      "path": "{fa}/window-maximize",
+      "scaleStroke": false
+    },
     "window-close": {
       "path": "{nucleo}/ui/{nucleo_simple}_bold-remove",
       "rmFill": true
@@ -46,7 +55,10 @@
       "path": "{fa}/commenting",
       "rmFill": true
     },
-    "conflict": "{fa}/bolt",
+    "conflict": {
+      "path": "{nucleo}/multimedia/{nucleo_simple}_flash-24",
+      "rmFill": true
+    },
     "download": {
       "path": "{nucleo}/arrows/{nucleo_simple}_square-download",
       "rmFill": true
@@ -140,6 +152,10 @@
       "path": "{nucleo}/design-development/{nucleo_simple}_spray-2",
       "rmFill": true
     },
+    "plugin-cleaned": {
+      "path": "{nucleo}/weather/{nucleo_simple}_drop-15",
+      "rmFill": true
+    },
     "plugin-native": "{fa}/lock",
     "plugin-dont-clean": {
       "path": "{nucleo}/ui/{nucleo_simple}_security",
@@ -185,7 +201,10 @@
       "path": "{nucleo}/text editing/{nucleo_simple}_list-bullet",
       "rmFill": true
     },
-    "launch-application": "{fa}/play-circle-o",
+    "launch-application": {
+      "path": "{fa}/play-circle-o",
+      "scaleStroke": false
+    },
     "launch-simple": {
       "path": "{nucleo}/multimedia/{nucleo_simple}_button-play",
       "rmFill": true
@@ -344,7 +363,10 @@
       "path": "{nucleo}/files-folders/{nucleo_simple}_bookmark-2",
       "rmFill": true
     },
-    "highlight-conflict": "{fa}/bolt",
+    "highlight-conflict": {
+      "path": "{nucleo}/multimedia/{nucleo_simple}_flash-24",
+      "rmFill": true
+    },
     "highlight-temple": {
       "path": "{nucleo}/travel/{nucleo_simple}_temple-25",
       "rmFill": true
@@ -358,7 +380,7 @@
       "rmFill": true
     },
     "highlight-map": {
-      "path": "{fa}/map",
+      "path": "{nucleo}/maps-location/{nucleo_simple}_map-big",
       "rmFill": true
     },
     "highlight-flag": {
@@ -367,6 +389,18 @@
     },
     "highlight-home": {
       "path": "{nucleo}/ui/{nucleo_simple}_home-51",
+      "rmFill": true
+    },
+    "highlight-person": {
+      "path": "{nucleo}/users/{nucleo_simple}_single-05",
+      "rmFill": true
+    },
+    "highlight-patch": {
+      "path": "{nucleo}/design-development/{nucleo_simple}_patch-34",
+      "rmFill": true
+    },
+    "highlight-visuals": {
+      "path": "{nucleo}/design-development/{nucleo_simple}_palette",
       "rmFill": true
     },
     "transfer": {
@@ -432,7 +466,7 @@
       "rmFill": true
     },
     "game-menu": {
-      "path": "{fa}/plus-square",
+      "path": "{nucleo}/user interface/{nucleo_simple}_small-add",
       "rmFill": true
     },
     "groups": {
@@ -481,6 +515,30 @@
     },
     "video": {
       "path": "{nucleo}/multimedia/{nucleo_simple}_play-69",
+      "rmFill": true
+    },
+    "clipboard": {
+      "path": "{fa}/clipboard",
+      "rmFill": true
+    },
+    "idea": {
+      "path": "{nucleo}/business-finance/{nucleo_simple}_bulb-63",
+      "rmFill": true
+    },
+    "support": {
+      "path": "{nucleo}/shopping/{nucleo_simple}_customer-support",
+      "rmFill": true
+    },
+    "official": {
+      "path": "{nucleo}/shopping/{nucleo_simple}_award",
+      "rmFill": true
+    },
+    "contributor": {
+      "path": "{nucleo}/users/{nucleo_simple}_a-share",
+      "rmFill": true
+    },
+    "announcements": {
+      "path": "{nucleo}/user interface/{nucleo_simple}_megaphone",
       "rmFill": true
     }
   }

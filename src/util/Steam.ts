@@ -15,7 +15,33 @@ export interface ISteamEntry {
   appid: string;
   name: string;
   gamePath: string;
+  lastUser: string;
   lastUpdated: Date;
+}
+
+export interface ISteamExec {
+  steamPath: string;
+  arguments: string[];
+}
+
+export class GamePathNotMatched extends Error {
+  private mGamePath: string;
+  private mEntryPaths: string[];
+  constructor(gamePath: string, entries: string[]) {
+    super('Unable to find matching steam path - '
+        + 'Please include your latest Vortex log file when reporting this issue!');
+    this.name = this.constructor.name;
+    this.mGamePath = gamePath;
+    this.mEntryPaths = entries;
+  }
+
+  public get gamePath() {
+    return this.mGamePath;
+  }
+
+  public get steamEntryPaths() {
+    return this.mEntryPaths;
+  }
 }
 
 export class GameNotFound extends Error {
@@ -36,6 +62,7 @@ export interface ISteam {
   findByName(namePattern: string): Promise<ISteamEntry>;
   findByAppId(appId: string | string[]): Promise<ISteamEntry>;
   allGames(): Promise<ISteamEntry[]>;
+  getSteamExecutionPath(gamePath: string, args?: string[]): Promise<ISteamExec>;
 }
 
 /**
@@ -52,10 +79,10 @@ class Steam implements ISteam {
     if (process.platform === 'win32') {
         // windows
         try {
-          const steamPath = winapi.RegGetValue('HKEY_CURRENT_USER', 'Software\\Valve\\Steam', 'SteamPath');
+          const steamPath =
+            winapi.RegGetValue('HKEY_CURRENT_USER', 'Software\\Valve\\Steam', 'SteamPath');
           this.mBaseFolder = Promise.resolve(steamPath.value as string);
-        }
-        catch (err) {
+        } catch (err) {
           log('info', 'steam not found', { error: err.message });
           this.mBaseFolder = Promise.resolve(undefined);
         }
@@ -77,6 +104,38 @@ class Steam implements ISteam {
         } else {
           return Promise.resolve(entry);
         }
+      });
+  }
+
+  /**
+   * Look up Steam's executable path and launch arguments for
+   *  the game we're attempting to start-up.
+   * @param gamePath - Used to identify the game's cache entry and retrieve the
+   *  corresponding appId.
+   * @param args - Can be used to add additional launch arguments.
+   */
+  public getSteamExecutionPath(gamePath: string, args?: string[]): Promise<ISteamExec> {
+    return this.allGames()
+      .then(entries => {
+        const found = entries.find(entry => {
+          const steamPath = entry.gamePath.toLowerCase();
+          const discoveryPath = gamePath.toLowerCase();
+          return discoveryPath.indexOf(steamPath) !== -1;
+        });
+        if (found === undefined) {
+          return Promise.reject(
+            new GamePathNotMatched(gamePath, entries.map(entry => entry.gamePath)));
+        }
+
+        return this.mBaseFolder.then((basePath: string) => {
+          const steamExec: ISteamExec = {
+            steamPath: basePath + '\\Steam.exe',
+            arguments: args !== undefined
+              ? ['-applaunch', found.appid, ...args]
+              : ['-applaunch', found.appid],
+          };
+          return Promise.resolve(steamExec);
+        });
       });
   }
 
@@ -153,8 +212,14 @@ class Steam implements ISteam {
                   appid: obj['AppState']['appid'],
                   name: obj['AppState']['name'],
                   gamePath: path.join(steamAppsPath, 'common', obj['AppState']['installdir']),
+                  lastUser: obj['AppState']['LastOwner'],
                   lastUpdated: new Date(obj['AppState']['LastUpdated'] * 1000),
                 }));
+            })
+            .catch({ code: 'ENOENT' }, (err: any) => {
+              // no biggy, this can happen for example if the steam library is on a removable medium
+              // which is currently removed
+              log('info', 'Steam library not found', err.code);
             })
             .catch(err => {
               log('warn', 'Failed to read steam library', err.message);
@@ -163,7 +228,7 @@ class Steam implements ISteam {
       })
       .then((games: ISteamEntry[][]) =>
         games.reduce((prev: ISteamEntry[], current: ISteamEntry[]): ISteamEntry[] =>
-          prev.concat(current), []));
+          current !== undefined ? prev.concat(current) : prev, []));
   }
 }
 

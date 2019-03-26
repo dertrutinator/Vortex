@@ -130,10 +130,10 @@ class Starter extends ComponentEx<IStarterProps, IWelcomeScreenState> {
           </Media.Left>
           <Media.Body>
             {this.renderToolIcons(game, discoveredGame)}
-            {this.renderRefresh()}
           </Media.Body>
           <Media.Right>
             {this.renderAddButton()}
+            {this.renderRefresh()}
           </Media.Right>
         </Media>
       );
@@ -152,7 +152,7 @@ class Starter extends ComponentEx<IStarterProps, IWelcomeScreenState> {
     return (
       <IconButton
         icon={discovering ? 'spinner' : 'refresh'}
-        tooltip={t('Refresh')}
+        tooltip={t('Quickscan')}
         onClick={this.quickDiscovery}
         className='refresh-button'
       />
@@ -238,6 +238,7 @@ class Starter extends ComponentEx<IStarterProps, IWelcomeScreenState> {
 
   private renderTool = (starter: StarterInfo) => {
     const { t, primaryTool } = this.props;
+    const { counter } = this.state;
     if (starter === undefined) {
       return null;
     }
@@ -247,6 +248,7 @@ class Starter extends ComponentEx<IStarterProps, IWelcomeScreenState> {
         t={t}
         key={starter.id}
         primary={starter.id === primaryTool}
+        counter={counter}
         starter={starter}
         onRun={this.startTool}
         onEdit={this.editTool}
@@ -317,7 +319,7 @@ class Starter extends ComponentEx<IStarterProps, IWelcomeScreenState> {
     const userTasks = starters
       .filter(starter =>
         (truthy(starter.exePath))
-        && (Object.keys(starter.environment).length === 0))
+        && (Object.keys(starter.environment || {}).length === 0))
       .map(starter => ({
         arguments: starter.commandLine.join(' '),
         description: starter.name,
@@ -420,6 +422,8 @@ class Starter extends ComponentEx<IStarterProps, IWelcomeScreenState> {
   }
 }
 
+const emptyObj = {};
+
 function mapStateToProps(state: any): IConnectedProps {
   const gameMode: string = activeGameId(state);
 
@@ -428,7 +432,7 @@ function mapStateToProps(state: any): IConnectedProps {
     knownGames: state.session.gameMode.known,
     discoveredGames: state.settings.gameMode.discovered,
     discoveredTools: getSafe(state, ['settings', 'gameMode',
-      'discovered', gameMode, 'tools'], {}),
+      'discovered', gameMode, 'tools'], emptyObj),
     primaryTool: getSafe(state, ['settings', 'interface', 'primaryTool', gameMode], undefined),
   };
 }

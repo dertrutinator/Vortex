@@ -17,12 +17,18 @@ const settingsReducer: IReducerSpec = {
       update(state, { profilesVisible: { $set: payload.visible } }),
     [actions.setDesktopNotifications as any]: (state, payload) =>
       update(state, { desktopNotifications: { $set: payload } }),
+    [actions.setHideTopLevelCategory as any]: (state, payload) =>
+      update(state, { hideTopLevelCategory: { $set: payload.hide } } ),
+    [actions.showUsageInstruction as any]: (state, payload) =>
+      update(state, { usage: { [payload.usageId]: { $set: payload.show } } }),
   },
   defaults: {
     language: 'en',
     advanced: false,
     profilesVisible: false,
     desktopNotifications: true,
+    hideTopLevelCategory: false,
+    usage: {},
   },
 };
 

@@ -1,4 +1,4 @@
-import {IExtensionApi} from '../../types/IExtensionContext';
+import {IDeployedFile, IExtensionApi} from '../../types/IExtensionContext';
 import {IGame} from '../../types/IGame';
 import * as fs from '../../util/fs';
 import getFileList, { IFileEntry } from '../../util/getFileList';
@@ -123,6 +123,7 @@ function mergeMods(api: IExtensionApi,
                    modBasePath: string,
                    destinationPath: string,
                    mods: IMod[],
+                   deployedFiles: IDeployedFile[],
                    mergers: IResolvedMerger[]): Promise<string[]> {
   if ((mergers.length === 0) && (game.mergeArchive === undefined)) {
     return Promise.resolve([]);
@@ -132,6 +133,14 @@ function mergeMods(api: IExtensionApi,
 
   const archiveMerges: { [relPath: string]: string[] } = {};
   const mergedFiles: string[] = [];
+
+  const fileExists = (file: string) => fs.statAsync(file)
+    .then(() => Promise.resolve(true))
+    .catch(() => Promise.resolve(false));
+
+  const isDeployed = (filePath: string) => deployedFiles.find(file =>
+    path.join(destinationPath, file.relPath).toLowerCase()
+    === filePath.toLowerCase()) !== undefined;
 
   // go through all files of all mods. do "mergers" immediately, store
   // archives to be merged for later
@@ -152,14 +161,44 @@ function mergeMods(api: IExtensionApi,
             const relPath = path.relative(modPath, fileEntry.filePath);
             mergedFiles.push(relPath);
             return fs.ensureDirAsync(realDest)
-              .then(() => Promise.map(merger.match.baseFiles(),
-                file => fs.removeAsync(path.join(realDest, file.out)).catch(err => null)
-                  .then(() => fs.copyAsync(file.in, path.join(realDest, file.out)))
-                  .catch(err => (err.code === 'ENOENT')
-                    // source file missing isn't really a big deal, treat as empty
-                      ? fs.ensureFileAsync(file.in)
-                      : Promise.reject(err))))
-              .then(() => merger.merge(fileEntry.filePath, realDest));
+              .then(() => Promise.map(merger.match.baseFiles(), file => {
+                if (mergedFiles.length !== 1) {
+                  // We've already started merging at this point, no reason
+                  //  to continue through merge setup.
+                  return Promise.resolve();
+                }
+
+                return Promise.all([fileExists(file.in),
+                                    fileExists(file.in + BACKUP_TAG)]).then(res => {
+                  // res[0] indicates whether we were able to find the input file inside
+                  //  the mods folder. Its existence can mean 2 things depending on circumstances:
+                  //  1. The file is a symlink and has been deployed using Vortex. We can confirm
+                  //   this by checking the deployed files array for this modtype.
+                  //  2. The file exists by default (created by the game itself).
+
+                  // res[1] indicates whether we are able to find an input file backup which is
+                  //  created by Vortex when deploying the output file, and a pre-existing input
+                  //  file was found during deployment. (See res[0], item 2). When res[1] === true,
+                  //  this is a clear indication that we have previously deployed mods for this
+                  //  modType; to avoid losing default game generated data, we MUST use the backup
+                  //  file as the base for the merge.
+                  if (res[1]) {
+                    // We found a backup file, use this file as the base for the merge.
+                    return fs.copyAsync(file.in + BACKUP_TAG, path.join(realDest, file.out));
+                  }
+
+                  if (res[0] && isDeployed(file.in)) {
+                    // The input file has been previously deployed by Vortex; in its current state
+                    //  the file is a symbolic link and should be removed before the merge to ensure
+                    //  that Vortex does not create a backup of it during deployment.
+                    //  The file will be re-created during the merge.
+                    return fs.removeAsync(file.in);
+                  }
+
+                  return Promise.resolve();
+                });
+            }))
+            .then(() => merger.merge(fileEntry.filePath, realDest));
           }
         }
         return Promise.resolve();

@@ -23,7 +23,8 @@ const identity = input => input;
 export const startNotification = safeCreateAction('ADD_NOTIFICATION', identity);
 
 export const updateNotification = safeCreateAction('UPDATE_NOTIFICATION',
-  (id: string, progress: number, message: string) => ({ id, progress, message }), () => ({ forward: false }));
+  (id: string, progress: number, message: string) => ({ id, progress, message }),
+  () => ({ forward: false }));
 
 /**
  * dismiss a notification. Takes the id of the notification
@@ -164,10 +165,11 @@ class DialogCallbacks {
  * @returns
  */
 export function showDialog(type: DialogType, title: string,
-                           content: IDialogContent, actions: DialogActions) {
+                           content: IDialogContent, actions: DialogActions,
+                           inId?: string) {
   return (dispatch) => {
     return new Promise<IDialogResult>((resolve, reject) => {
-      const id = shortid();
+      const id = inId || shortid();
       const defaultAction = actions.find(iter => iter.default === true);
       const defaultLabel = defaultAction !== undefined ? defaultAction.label : undefined;
       dispatch(addDialog(id, type, title, content, defaultLabel,
@@ -180,7 +182,7 @@ export function showDialog(type: DialogType, title: string,
             if ((res !== undefined) && (res.catch !== undefined)) {
               res.catch(err => {
                 log('error', 'rejection from dialog callback', {
-                  title: title,
+                  title,
                   action: action.label,
                   message: err.message,
                 });
@@ -203,11 +205,11 @@ export function showDialog(type: DialogType, title: string,
   };
 }
 
-export function closeDialog(id: string, actionKey: string, input: any) {
+export function closeDialog(id: string, actionKey?: string, input?: any) {
   return (dispatch) => {
     dispatch(dismissDialog(id));
     try {
-      if (DialogCallbacks.instance()[id] !== undefined) {
+      if ((actionKey !== undefined) && (DialogCallbacks.instance()[id] !== undefined)) {
         DialogCallbacks.instance()[id](actionKey, input);
       }
     } catch (err) {

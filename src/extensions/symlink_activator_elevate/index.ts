@@ -10,6 +10,7 @@ import LinkingDeployment from '../mod_management/LinkingDeployment';
 import {
   IDeployedFile,
   IDeploymentMethod,
+  IUnavailableReason,
 } from '../mod_management/types/IDeploymentMethod';
 
 import { remoteCode } from './remoteCode';
@@ -38,6 +39,7 @@ class DeploymentMethod extends LinkingDeployment {
   private mOpenRequests: { [num: number]: { resolve: () => void, reject: (err: Error) => void } };
   private mDone: () => void;
   private mWaitForUser: () => Promise<void>;
+  private mOnReport: (report: string) => void;
 
   constructor(api: IExtensionApi) {
     super(
@@ -60,6 +62,23 @@ class DeploymentMethod extends LinkingDeployment {
           action: dismiss => { dismiss(); reject(new UserCanceled()); },
         }],
       }));
+
+    let lastReport: string;
+    this.mOnReport = (report: string) => {
+      if (report === lastReport) {
+        return;
+      }
+
+      lastReport = report;
+
+      if (report === 'not-supported') {
+        api.showErrorNotification('Symlinks not support',
+          'It appears symbolic links aren\'t supported between your mod staging folder and game '
+          + 'folder. On Windows, symbolic links only work on NTFS drives', { allowReport: false });
+      } else {
+        api.showErrorNotification('Unknown error', report);
+      }
+    };
   }
 
   public detailedDescription(t: I18next.TranslationFunction): string {
@@ -99,30 +118,33 @@ class DeploymentMethod extends LinkingDeployment {
     });
     this.mOpenRequests = {};
     return this.startElevated()
-        .tapCatch(() => {
-          this.context.onComplete();
-        })
+        .tapCatch(() => this.context.onComplete())
         .then(() => super.finalize(gameId, dataPath, installationPath))
         .then(result => this.stopElevated().then(() => result));
   }
 
-  public isSupported(state: any, gameId?: string): string {
+  public isSupported(state: any, gameId?: string): IUnavailableReason {
     if (process.platform !== 'win32') {
-      return 'Not required on non-windows systems';
+      return { description: t => t('Elevation not required on non-windows systems') };
     }
     if (gameId === undefined) {
       gameId = activeGameId(state);
     }
-    if (this.isGamebryoGame(gameId)) {
-      return 'Doesn\'t work with games based on the gamebryo engine '
-        + '(including Skyrim SE and Fallout 4)';
-    }
-    if (this.isUnsupportedGame(gameId)) {
+    if (this.isGamebryoGame(gameId) || this.isUnsupportedGame(gameId)) {
       // Mods for this games use some file types that have issues working with symbolic links
-      return 'Doesn\'t work with ' + gameName(state, gameId);
+      return {
+        description: t => t('Incompatible with "{{name}}".', {
+          replace: {
+            name: gameName(state, gameId),
+          },
+        }),
+      };
     }
     if (this.ensureAdmin()) {
-      return 'No need to use the elevated variant, use the regular symlink deployment';
+      return {
+        description: t =>
+          t('No need to use the elevated variant, use the regular symlink deployment'),
+      };
     }
     return undefined;
   }
@@ -232,6 +254,9 @@ class DeploymentMethod extends LinkingDeployment {
       ipc.server.on('log', (data: any) => {
         log(data.level, data.message, data.meta);
       });
+      ipc.server.on('report', (data: string) => {
+        this.mOnReport(data);
+      });
       ipc.server.on('error', err => {
         log('error', 'Failed to start symlink activator', err);
       });
@@ -251,10 +276,14 @@ class DeploymentMethod extends LinkingDeployment {
         .tapCatch(() => {
           ipc.server.stop();
         })
+        // Error 1223 is the current standard Windows system error code
+        //  for ERROR_CANCELLED, which in this case is raised if the user
+        //  selects to deny elevation when prompted.
+        //  https://docs.microsoft.com/en-us/windows/desktop/debug/system-error-codes--1000-1299-
         .catch(err => (err.code === 5)
+          || ((process.platform === 'win32') && (err.errno === 1223))
             ? reject(new UserCanceled())
-            : reject(err)
-        )
+            : reject(err))
         .catch(reject);
     });
   }
@@ -292,13 +321,17 @@ class DeploymentMethod extends LinkingDeployment {
 
   private isGamebryoGame(gameId: string): boolean {
     return [
-      'morrowind', 'oblivion', 'skyrim', 'skyrimse', 'skyrimvr',
+      'morrowind', 'oblivion', 'skyrim', 'enderal', 'skyrimse', 'skyrimvr',
       'fallout4', 'fallout4vr', 'fallout3', 'falloutnv',
     ].indexOf(gameId) !== -1;
   }
 
   private isUnsupportedGame(gameId: string): boolean {
-    return ['nomanssky', 'stateofdecay'].indexOf(gameId) !== -1;
+    const unsupportedGames = (process.platform === 'win32')
+      ? ['nomanssky', 'stateofdecay', 'factorio']
+      : ['nomanssky', 'stateofdecay'];
+
+    return unsupportedGames.indexOf(gameId) !== -1;
   }
 }
 

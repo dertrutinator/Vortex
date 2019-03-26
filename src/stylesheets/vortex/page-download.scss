@@ -32,7 +32,7 @@
 
 .active-downloads-slim {
   white-space: nowrap;
-  font-size: xx-small;
+  font-size: 0.75em;
 }
 
 .active-downloads-container {
@@ -65,14 +65,12 @@
   }
   .header-game,
   .header-progress,
-  .header-filetime,
-  .header-filesize {
+  .header-filetime {
     // need a bit of space so the dropdown menu is readable
     min-width: 150px;
   }
-  .header-filename {
-    // use up remaining space
-    width: 100%;
+  .cell-filesize {
+    white-space: nowrap;
   }
 }
 

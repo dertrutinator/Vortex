@@ -5,7 +5,8 @@ import IconBar from '../../../controls/IconBar';
 import { IconButton } from '../../../controls/TooltipControls';
 import { IActionDefinition } from '../../../types/IActionDefinition';
 import { IComponentContext } from '../../../types/IComponentContext';
-import { DialogActions, DialogType, IDialogContent, IDialogResult } from '../../../types/IDialog';
+import { DialogActions, DialogType, IConditionResult, IDialogContent,
+         IDialogResult, IInput } from '../../../types/IDialog';
 import { IErrorOptions } from '../../../types/IExtensionContext';
 import { IState } from '../../../types/IState';
 import { ComponentEx, connect, translate } from '../../../util/ComponentEx';
@@ -98,11 +99,11 @@ class CategoryList extends ComponentEx<IProps, IComponentState> {
         icon: 'collapse-all',
         action: this.collapseAll,
       }, {
-        title: t('Add Root Category'),
+        title: t('Add Root'),
         icon: 'folder-add',
         action: this.addRootCategory,
       }, {
-        title: t('Toggle empty categories'),
+        title: t('Show/Hide Empty'),
         icon: 'hide',
         action: this.toggleShowEmpty,
       },
@@ -247,7 +248,8 @@ class CategoryList extends ComponentEx<IProps, IComponentState> {
       this.nextState.showEmpty = !showEmpty;
       this.updateExpandedTreeData(categories);
     } catch (err) {
-      onShowError('An error occurred hiding/showing the empty categories', err, { allowReport: false });
+      onShowError('An error occurred hiding/showing the empty categories',
+                  err, { allowReport: false });
     }
   }
 
@@ -263,26 +265,28 @@ class CategoryList extends ComponentEx<IProps, IComponentState> {
   }
 
   private renameCategory = (categoryId: string) => {
-    const {categories, gameMode, onShowDialog, onRenameCategory, onShowError} = this.props;
+    const {categories, gameMode, onShowDialog, onRenameCategory} = this.props;
 
     const category = categories[categoryId];
+    // one user seems to have managed to get this called on a category that (no longer?)
+    // exists
+    if (category === undefined) {
+      return;
+    }
 
     onShowDialog('info', 'Rename Category', {
       input: [{ id: 'newCategory', value: category.name, label: 'Category' }],
+      condition: this.validateCategoryDialog,
     }, [ { label: 'Cancel' }, { label: 'Rename' } ])
     .then((result: IDialogResult) => {
-        if ((result.action === 'Rename') && (result.input.newCategory !== undefined)) {
-          if (result.input.newCategory === '') {
-            onShowError('Category Name cannot be empty.', undefined, { allowReport: false });
-          } else {
-            onRenameCategory(gameMode, categoryId, result.input.newCategory);
-          }
+        if (result.action === 'Rename') {
+          onRenameCategory(gameMode, categoryId, result.input.newCategory);
         }
       });
   }
 
   private addCategory = (parentId: string) => {
-    const {categories, gameMode, onSetCategory, onShowDialog, onShowError} = this.props;
+    const {categories, gameMode, onSetCategory, onShowDialog} = this.props;
     const lastIndex = this.searchLastRootId(categories);
 
     if (Array.isArray(parentId)) {
@@ -292,37 +296,57 @@ class CategoryList extends ComponentEx<IProps, IComponentState> {
     onShowDialog('question', 'Add Child Category', {
       input: [
         { id: 'newCategory', value: '', label: 'Category Name' },
-        {
-          id: 'newCategoryId',
-          value: lastIndex.toString(),
-          label: 'Category ID',
-        },
+        { id: 'newCategoryId', value: lastIndex.toString(), label: 'Category ID' },
       ],
+      condition: this.validateCategoryDialog,
     }, [{ label: 'Cancel' }, { label: 'Add' }])
     .then((result: IDialogResult) => {
-        if (result.action === 'Add') {
-          const checkId = Object.keys(categories).filter((id: string) =>
-            id === result.input.newCategoryId);
-          if (checkId.length !== 0) {
-            onShowError('ID already used.', undefined, { allowReport: false });
-          } else if (result.input.newCategoryId === '') {
-            onShowError('Category ID cannot be empty.', undefined, { allowReport: false });
-          } else if (result.input.newCategory === '') {
-            onShowError('Category Name cannot be empty.', undefined, { allowReport: false });
-          } else {
-            onSetCategory(gameMode, result.input.newCategoryId, {
-              name: result.input.newCategory,
-              parentCategory: parentId,
-              order: 0,
-            });
-          }
+      if (result.action === 'Add') {
+        onSetCategory(gameMode, result.input.newCategoryId, {
+          name: result.input.newCategory,
+          parentCategory: parentId,
+          order: 0,
+        });
+      }
+    });
+  }
+
+  private hasEmptyInput = (input: IInput): IConditionResult => {
+    const { t } = this.props;
+    return input.value === ''
+      ? {
+          id: input.id,
+          actions: ['Add', 'Rename'],
+          errorText: t('{{label}} cannot be empty.', {
+            replace: { label: input.label ? input.label : 'Field' },
+          }),
         }
-      });
+      : undefined;
+  }
+
+  private idExists = (input: IInput): IConditionResult => {
+    const { t, categories } = this.props;
+    return categories[input.value] !== undefined
+      ? { id: input.id,
+          actions: ['Add'],
+          errorText: t('ID already used.') }
+      : undefined;
+  }
+
+  private validateCategoryDialog = (content: IDialogContent): IConditionResult[] => {
+    const results: IConditionResult[] = [];
+    content.input.forEach(inp => {
+      results.push(this.hasEmptyInput(inp));
+      if (inp.id === 'newCategoryId') {
+        results.push(this.idExists(inp));
+      }
+    });
+
+    return results.filter(res => res !== undefined);
   }
 
   private addRootCategory = () => {
     const {categories, gameMode, onSetCategory, onShowDialog, onShowError} = this.props;
-    let addCategory = true;
     const lastIndex = this.searchLastRootId(categories);
 
     onShowDialog('question', 'Add new Root Category', {
@@ -333,37 +357,27 @@ class CategoryList extends ComponentEx<IProps, IComponentState> {
           label: 'Category ID',
         },
       ],
+      condition: this.validateCategoryDialog,
     }, [{ label: 'Cancel' }, { label: 'Add', default: true }])
       .then((result: IDialogResult) => {
-        addCategory = result.action === 'Add';
-        if (addCategory) {
-          const checkId = Object.keys(categories || {}).filter((id: string) =>
-            id === result.input.newCategoryId);
-          if (checkId.length !== 0) {
-            onShowError('An error occurred adding the new category', 'ID already used.', { allowReport: false });
-          } else if (result.input.newCategoryId === '') {
-            onShowError('An error occurred adding the new category', 'Category ID cannot be empty.', { allowReport: false });
-          } else if (result.input.newCategory === '') {
-            onShowError('An error occurred adding the new category', 'Category Name cannot be empty.', { allowReport: false });
-          } else {
-            onSetCategory(gameMode, result.input.newCategoryId, {
-              name: result.input.newCategory,
-              parentCategory: undefined,
-              order: 0,
-            });
-          }
+        if (result.action === 'Add') {
+          onSetCategory(gameMode, result.input.newCategoryId, {
+            name: result.input.newCategory,
+            parentCategory: undefined,
+            order: 0,
+          });
         }
       });
   }
 
   private searchLastRootId(categories: ICategoryDictionary) {
-    let maxId = 0;
+    let maxId = 1000;
     if (categories !== undefined) {
-    Object.keys(categories).filter((id: string) => {
-      if (parseInt(id, 10) > maxId) {
-        maxId = parseInt(id, 10);
-      }
-    });
+      Object.keys(categories).filter((id: string) => {
+        if (parseInt(id, 10) > maxId) {
+          maxId = parseInt(id, 10);
+        }
+      });
     }
     return maxId + 1;
   }

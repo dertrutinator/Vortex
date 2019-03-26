@@ -11,7 +11,7 @@
  * - ignoring ENOENT error when deleting a file.
  */
 
-import { UserCanceled } from './CustomErrors';
+import { DataInvalid, ProcessCanceled, UserCanceled } from './CustomErrors';
 import { log } from './log';
 
 import * as PromiseBB from 'bluebird';
@@ -24,6 +24,7 @@ import { allow as allowT, getUserId } from 'permissions';
 import * as rimraf from 'rimraf';
 import { generate as shortid } from 'shortid';
 import { runElevated } from 'vortex-run';
+import wholocks from 'wholocks';
 
 const dialog = remote !== undefined ? remote.dialog : dialogIn;
 
@@ -40,6 +41,7 @@ export {
   readFileSync,
   readJSONSync,
   statSync,
+  symlinkSync,
   watch,
   writeFileSync,
   writeSync,
@@ -47,23 +49,61 @@ export {
 
 const NUM_RETRIES = 3;
 const RETRY_DELAY_MS = 100;
-const RETRY_ERRORS = new Set(['EPERM', 'EBUSY', 'EUNKNOWN']);
+const RETRY_ERRORS = new Set(['EPERM', 'EBUSY', 'UNKNOWN']);
+
+function nospcQuery(): PromiseBB<boolean> {
+  if (dialog === undefined) {
+    return PromiseBB.resolve(false);
+  }
+
+  const options: Electron.MessageBoxOptions = {
+    title: 'Disk full',
+    message: `Operation can't continue because the disk is full. `
+           + 'Please free up some space and click retry. Cancelling the transfer operation '
+           + 'at this point will remove any changes and revert back to the previous state.',
+    buttons: ['Cancel', 'Retry'],
+    type: 'warning',
+    noLink: true,
+  };
+
+  const choice = dialog.showMessageBox(
+    remote !== undefined ? remote.getCurrentWindow() : null,
+    options);
+  return (choice === 0)
+    ? PromiseBB.reject(new UserCanceled())
+    : PromiseBB.resolve(true);
+}
 
 function unlockConfirm(filePath: string): PromiseBB<boolean> {
   if (dialog === undefined) {
     return PromiseBB.resolve(false);
   }
 
-  const options: Electron.MessageBoxOptions = {
-    title: 'Access denied',
-    message: `Vortex needs to access "${filePath}" but doesn\'t have permission to.\n`
-      + 'If your account has admin rights Vortex can unlock the file for you. '
-      + 'Windows will show an UAC dialog.',
-    buttons: [
+  const processes = wholocks(filePath);
+
+  const baseMessage = processes.length === 0
+    ? `Vortex needs to access "${filePath}" but doesn\'t have permission to.`
+    : `Vortex needs to access "${filePath}" but it either has too restrictive `
+      + 'permissions or is locked by another process.';
+
+  const buttons = [
       'Cancel',
       'Retry',
-      'Give permission',
-    ],
+  ];
+
+  if (processes.length === 0) {
+    buttons.push('Give permission');
+  }
+
+  const options: Electron.MessageBoxOptions = {
+    title: 'Access denied',
+    message: baseMessage
+      + ' If your account has admin rights Vortex can try to unlock the file for you.',
+    detail: processes.length === 0
+      ? undefined
+      : 'Please close the following applications and retry:\n'
+        + processes.map(proc => `${proc.appName} (${proc.pid})`).join('\n'),
+    buttons,
     type: 'warning',
     noLink: true,
   };
@@ -74,7 +114,6 @@ function unlockConfirm(filePath: string): PromiseBB<boolean> {
   return (choice === 0)
     ? PromiseBB.reject(new UserCanceled())
     : PromiseBB.resolve(choice === 2);
-
 }
 
 function busyRetry(filePath: string): PromiseBB<boolean> {
@@ -82,17 +121,20 @@ function busyRetry(filePath: string): PromiseBB<boolean> {
     return PromiseBB.resolve(false);
   }
 
+  const processes = wholocks(filePath);
   const options: Electron.MessageBoxOptions = {
-      title: 'File busy',
-      message: `Vortex needs to access "${filePath}" but it\'s open in another application. `
-             + 'Please close the file in all other applications and then retry',
-      buttons: [
-        'Cancel',
-        'Retry',
-      ],
-      type: 'warning',
-      noLink: true,
-    };
+    title: 'File busy',
+    message: `Vortex needs to access "${filePath}" but it\'s open in another application. `
+      + 'Please close the file in all other applications and then retry.',
+    detail: 'Please close the following applications and retry:\n'
+          + processes.map(proc => `${proc.appName} (${proc.pid})`).join('\n'),
+    buttons: [
+      'Cancel',
+      'Retry',
+    ],
+    type: 'warning',
+    noLink: true,
+  };
 
   const choice = dialog.showMessageBox(
     remote !== undefined ? remote.getCurrentWindow() : null,
@@ -105,6 +147,8 @@ function busyRetry(filePath: string): PromiseBB<boolean> {
 function errorRepeat(error: NodeJS.ErrnoException, filePath: string): PromiseBB<boolean> {
   if (error.code === 'EBUSY') {
     return busyRetry(filePath);
+  } else if (error.code === 'ENOSPC') {
+    return nospcQuery();
   } else if (error.code === 'EPERM') {
     return unlockConfirm(filePath)
       .then(doUnlock => {
@@ -120,7 +164,7 @@ function errorRepeat(error: NodeJS.ErrnoException, filePath: string): PromiseBB<
               // elevate - while interesting as well - would make error handling too complicated
               log('error', 'failed to acquire permission', {
                 filePath,
-                error: elevatedErr.message
+                error: elevatedErr.message,
               });
               return Promise.reject(error);
             });
@@ -138,7 +182,8 @@ function restackErr(error: Error, stackErr: Error): Error {
   // that will apply expensive source mapping when called
   Object.defineProperty(error, 'stack', {
     get: () => error.message + '\n' + stackErr.stack,
-  })
+    set: () => null,
+  });
   return error;
 }
 
@@ -151,7 +196,7 @@ function errorHandler(error: NodeJS.ErrnoException, stackErr: Error): PromiseBB<
 }
 
 function genWrapperAsync<T extends (...args) => any>(func: T): T {
-  const wrapper = (stackErr: Error, ...args) => 
+  const wrapper = (stackErr: Error, ...args) =>
     func(...args)
       .catch(err => errorHandler(err, stackErr)
         .then(() => wrapper(stackErr, ...args)));
@@ -166,6 +211,7 @@ const fsyncAsync = genWrapperAsync(fs.fsyncAsync);
 const linkAsync = genWrapperAsync(fs.linkAsync);
 const lstatAsync = genWrapperAsync(fs.lstatAsync);
 const mkdirAsync = genWrapperAsync(fs.mkdirAsync);
+const mkdirsAsync = genWrapperAsync(fs.mkdirsAsync);
 const moveAsync = genWrapperAsync(fs.moveAsync);
 const openAsync = genWrapperAsync(fs.openAsync);
 const readdirAsync = genWrapperAsync(fs.readdirAsync);
@@ -185,6 +231,7 @@ export {
   linkAsync,
   lstatAsync,
   mkdirAsync,
+  mkdirsAsync,
   moveAsync,
   openAsync,
   readlinkAsync,
@@ -226,7 +273,7 @@ export function ensureDirAsync(dirPath: string): PromiseBB<void> {
 
 function selfCopyCheck(src: string, dest: string) {
   return PromiseBB.join(fs.statAsync(src), fs.statAsync(dest)
-                .catch(err => err.code === 'ENOENT' ? PromiseBB.resolve({}) : PromiseBB.reject(err)))
+                .catch({ code: 'ENOENT' }, err => PromiseBB.resolve({})))
     .then((stats: fs.Stats[]) => (stats[0].ino === stats[1].ino)
         ? PromiseBB.reject(new Error(
           `Source "${src}" and destination "${dest}" are the same file (id "${stats[0].ino}").`))
@@ -235,11 +282,11 @@ function selfCopyCheck(src: string, dest: string) {
 
 /**
  * copy file
- * The copy function from fs-extra doesn't (at the time of writing) correctly check that a file isn't
- * copied onto itself (it fails for links or potentially on case insensitive disks), so this makes
- * a check based on the ino number.
- * Unfortunately a bug in node.js (https://github.com/nodejs/node/issues/12115) prevents this check from
- * working reliably so it can currently be disabled.
+ * The copy function from fs-extra doesn't (at the time of writing) correctly check that a file
+ * isn't copied onto itself (it fails for links or potentially on case insensitive disks),
+ * so this makes a check based on the ino number.
+ * Unfortunately a bug in node.js (https://github.com/nodejs/node/issues/12115) prevents this
+ * check from working reliably so it can currently be disabled.
  * @param src file to copy
  * @param dest destination path
  * @param options copy options (see documentation for fs)
@@ -266,28 +313,7 @@ function copyInt(
 }
 
 export function removeSync(dirPath: string) {
-  rimraf.sync(dirPath, { maxBusyTries: 10 });
-}
-
-export function removeAsync(dirPath: string): PromiseBB<void> {
-  return removeInt(dirPath, new Error());
-}
-
-function removeInt(dirPath: string, stackErr: Error): PromiseBB<void> {
-  return new PromiseBB<void>((resolve, reject) => {
-    rimraf(dirPath, { maxBusyTries: 10 }, err => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve();
-      }
-    })
-  })
-    .catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT')
-      // don't mind if a file we wanted deleted was already gone
-      ? PromiseBB.resolve()
-      : errorHandler(err, stackErr)
-        .then(() => removeInt(dirPath, stackErr)));
+  fs.removeSync(dirPath);
 }
 
 export function unlinkAsync(dirPath: string): PromiseBB<void> {
@@ -304,20 +330,27 @@ function unlinkInt(dirPath: string, stackErr: Error): PromiseBB<void> {
 }
 
 export function renameAsync(sourcePath: string, destinationPath: string): PromiseBB<void> {
-  return renameInt(sourcePath, destinationPath, new Error());
+  return renameInt(sourcePath, destinationPath, new Error(), NUM_RETRIES);
 }
 
-function renameInt(sourcePath: string, destinationPath: string, stackErr: Error): PromiseBB<void> {
+function renameInt(sourcePath: string, destinationPath: string,
+                   stackErr: Error, tries: number): PromiseBB<void> {
   return fs.renameAsync(sourcePath, destinationPath)
-    .catch((err: NodeJS.ErrnoException) => (err.code === 'EPERM')
-      ? fs.statAsync(destinationPath)
-        .then(stat => stat.isDirectory()
-          ? PromiseBB.reject(restackErr(err, stackErr))
-          : errorHandler(err, stackErr)
-            .then(() => renameInt(sourcePath, destinationPath, stackErr)))
-        .catch(newErr => PromiseBB.reject(restackErr(newErr, stackErr)))
-      : errorHandler(err, stackErr)
-        .then(() => renameInt(sourcePath, destinationPath, stackErr)));
+    .catch((err: NodeJS.ErrnoException) => {
+      if ((tries > 0) && RETRY_ERRORS.has(err.code)) {
+        return PromiseBB.delay(RETRY_DELAY_MS)
+          .then(() => renameInt(sourcePath, destinationPath, stackErr, tries - 1));
+      }
+      return (err.code === 'EPERM')
+        ? fs.statAsync(destinationPath)
+          .then(stat => stat.isDirectory()
+            ? PromiseBB.reject(restackErr(err, stackErr))
+            : errorHandler(err, stackErr)
+              .then(() => renameInt(sourcePath, destinationPath, stackErr, tries)))
+          .catch(newErr => PromiseBB.reject(restackErr(newErr, stackErr)))
+        : errorHandler(err, stackErr)
+          .then(() => renameInt(sourcePath, destinationPath, stackErr, tries));
+    });
 }
 
 export function rmdirAsync(dirPath: string): PromiseBB<void> {
@@ -338,6 +371,33 @@ function rmdirInt(dirPath: string, stackErr: Error, tries: number): PromiseBB<vo
     });
 }
 
+export function removeAsync(remPath: string): PromiseBB<void> {
+  const stackErr = new Error();
+  return removeInt(remPath, stackErr);
+}
+
+function removeInt(remPath: string, stackErr: Error): PromiseBB<void> {
+  return rimrafAsync(remPath)
+    .catch(err => errorHandler(err, stackErr)
+      .then(() => removeInt(remPath, stackErr)));
+}
+
+function rimrafAsync(remPath: string): PromiseBB<void> {
+  return new PromiseBB((resolve, reject) => {
+    // don't use the rimraf implementation of busy retries because it's f*cked:
+    // https://github.com/isaacs/rimraf/issues/187
+    rimraf(remPath, {
+      maxBusyTries: 0,
+    }, err => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
 function elevated(func: (ipc, req: NodeRequireFunction) => Promise<void>,
                   parameters: any): PromiseBB<void> {
   return new PromiseBB<void>((resolve, reject) => {
@@ -347,7 +407,8 @@ function elevated(func: (ipc, req: NodeRequireFunction) => Promise<void>,
     ipcInst.serve(`__fs_elevated_${id}`, () => {
       runElevated(`__fs_elevated_${id}`, func, parameters)
         .catch(err => {
-          if (err.code === 5) {
+          if ((err.code === 5)
+              || ((process.platform === 'win32') && (err.errno === 1223))) {
             // this code is returned when the user rejected the UAC dialog. Not currently
             // aware of another case
             reject(new UserCanceled());
@@ -413,55 +474,123 @@ export function ensureDirWritableAsync(dirPath: string,
     });
 }
 
-export function forcePerm<T>(t: I18next.TranslationFunction, op: () => PromiseBB<T>): PromiseBB<T> {
+export function changeFileOwnership(filePath: string, stat: fs.Stats): PromiseBB<void> {
+  if (process.platform === 'win32') {
+    // This is a *nix only function.
+    return PromiseBB.resolve();
+  }
+
+  const readAndWriteOther = parseInt('0006', 8);
+  if ((stat.mode & readAndWriteOther) === readAndWriteOther) {
+    return PromiseBB.reject(new ProcessCanceled('Ownership change not required'));
+  }
+
+  const readAndWriteGroup = parseInt('0060', 8);
+  const hasGroupPermissions = ((stat.mode & readAndWriteGroup) === readAndWriteGroup);
+
+  // (Writing this down as it can get confusing) Cases where we need to change ownership are:
+  //  <BaseOwnerCheck> - If the process real ID is different than the file's real ID.
+  //
+  //  1. If <BaseOwnerCheck> is true and the file does NOT have the group read/write bits set.
+  //  2. If <BaseOwnerCheck> is true and the file DOES have the group read/write bits set but
+  //   the process group id differs from the file's group id.
+  //
+  // Ask for forgiveness, not permission.
+  return (stat.uid !== process.getuid())
+    ? (!hasGroupPermissions) || (hasGroupPermissions && (stat.gid !== process.getgid()))
+      ? fs.chownAsync(filePath, process.getuid(), stat.gid).catch(err => PromiseBB.reject(err))
+      : PromiseBB.resolve()
+    : PromiseBB.resolve();
+}
+
+export function changeFileAttributes(filePath: string,
+                                     wantedAttributes: number,
+                                     stat: fs.Stats): PromiseBB<void> {
+    return this.changeFileOwnership(filePath, stat)
+      .then(() => {
+        const finalAttributes = stat.mode | wantedAttributes;
+        return fs.chmodAsync(filePath, finalAttributes);
+    })
+    .catch(ProcessCanceled, () => PromiseBB.resolve())
+    .catch(err => PromiseBB.reject(err));
+}
+
+export function ensureFileWritableAsync(filePath: string): PromiseBB<void> {
+  const wantedAttributes = process.platform === 'win32' ? parseInt('0666', 8) : parseInt('0600', 8);
+  return fs.statAsync(filePath).then(stat => {
+    if (!stat.isFile()) {
+      return PromiseBB.reject(new DataInvalid(`${filePath} - is not a file!`));
+    }
+
+    return ((stat.mode & wantedAttributes) !== wantedAttributes)
+      ? this.changeFileAttributes(filePath, wantedAttributes, stat)
+      : PromiseBB.resolve();
+  });
+}
+
+export function forcePerm<T>(t: I18next.TranslationFunction,
+                             op: () => PromiseBB<T>,
+                             filePath?: string): PromiseBB<T> {
+  const raiseUACDialog = (err): PromiseBB<T> => {
+    let fileToAccess = filePath !== undefined ? filePath : err.path;
+    const choice = dialog.showMessageBox(
+      remote !== undefined ? remote.getCurrentWindow() : null, {
+      title: 'Access denied (2)',
+      message: t('Vortex needs to access "{{ fileName }}" but doesn\'t have permission to.\n'
+               + 'If your account has admin rights Vortex can unlock the file for you. '
+               + 'Windows will show an UAC dialog.',
+        { replace: { fileName: fileToAccess } }),
+      buttons: [
+        'Cancel',
+        'Retry',
+        'Give permission',
+      ],
+      noLink: true,
+      type: 'warning',
+    });
+    if (choice === 1) { // Retry
+      return forcePerm(t, op);
+    } else if (choice === 2) { // Give Permission
+      const userId = getUserId();
+      return fs.statAsync(fileToAccess)
+        .catch((statErr) => {
+          if (statErr.code === 'ENOENT') {
+            fileToAccess = path.dirname(fileToAccess);
+          }
+          return PromiseBB.resolve();
+        })
+        .then(() => elevated((ipcPath, req: NodeRequireFunction) => {
+          // tslint:disable-next-line:no-shadowed-variable
+          const { allow } = req('permissions');
+          return allow(fileToAccess, userId, 'rwx');
+        }, { fileToAccess, userId })
+          .catch(elevatedErr => {
+            if (elevatedErr.message.indexOf('The operation was canceled by the user') !== -1) {
+              return Promise.reject(new UserCanceled());
+            }
+            // if elevation failed, return the original error because the one from
+            // elevate, while interesting as well, would make error handling too complicated
+            log('error', 'failed to acquire permission', elevatedErr.message);
+            return Promise.reject(err);
+          }))
+        .then(() => forcePerm(t, op));
+    } else {
+      return PromiseBB.reject(new UserCanceled());
+    }
+  };
+
   return op()
     .catch(err => {
+      const fileToAccess = filePath !== undefined ? filePath : err.path;
       if ((err.code === 'EPERM') || (err.errno === 5)) {
-        const choice = dialog.showMessageBox(
-          remote !== undefined ? remote.getCurrentWindow() : null, {
-          title: 'Access denied (2)',
-          message: t('Vortex needs to access "{{ fileName }}" but doesn\'t have permission to.\n'
-                   + 'If your account has admin rights Vortex can unlock the file for you. '
-                   + 'Windows will show an UAC dialog.',
-            { replace: { fileName: err.path } }),
-          buttons: [
-            'Cancel',
-            'Rety',
-            'Give permission',
-          ],
-          noLink: true,
-          type: 'warning',
-        });
-        if (choice === 1) { // Retry
-          return forcePerm(t, op);
-        } else if (choice === 2) { // Give Permission
-          let filePath = err.path;
-          const userId = getUserId();
-          return fs.statAsync(err.path)
-            .catch((statErr) => {
-              if (statErr.code === 'ENOENT') {
-                filePath = path.dirname(filePath);
-              }
-              return PromiseBB.resolve();
-            })
-            .then(() => elevated((ipcPath, req: NodeRequireFunction) => {
-              // tslint:disable-next-line:no-shadowed-variable
-              const { allow } = req('permissions');
-              return allow(filePath, userId, 'rwx');
-            }, { filePath, userId })
-              .catch(elevatedErr => {
-                if (elevatedErr.message.indexOf('The operation was canceled by the user') !== -1) {
-                  return Promise.reject(new UserCanceled());
-                }
-                // if elevation failed, return the original error because the one from
-                // elevate, while interesting as well, would make error handling too complicated
-                log('error', 'failed to acquire permission', elevatedErr.message);
-                return Promise.reject(err);
-              }))
-            .then(() => forcePerm(t, op));
-        } else {
-          return PromiseBB.reject(new UserCanceled());
-        }
+        const wantedAttributes = process.platform === 'win32'
+          ? parseInt('0666', 8)
+          : parseInt('0600', 8);
+        return fs.statAsync(fileToAccess)
+          .then(stat => this.changeFileAttributes(fileToAccess, wantedAttributes, stat))
+          .then(() => op())
+          .catch(() => raiseUACDialog(err))
+          .catch(UserCanceled, () => undefined);
       } else {
         return PromiseBB.reject(err);
       }

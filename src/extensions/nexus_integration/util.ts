@@ -1,24 +1,32 @@
 import * as Promise from 'bluebird';
+import { app as appIn, ipcRenderer, remote } from 'electron';
 import * as I18next from 'i18next';
-import Nexus, { IDownloadURL, IFileInfo, IGameListEntry, IModInfo, NexusError, TimeoutError } from 'nexus-api';
+import Nexus, { IFileInfo, IGameListEntry, IModInfo, NexusError,
+                RateLimitError, TimeoutError } from 'nexus-api';
 import * as Redux from 'redux';
+import * as semver from 'semver';
 import * as util from 'util';
 import { setModAttribute } from '../../actions';
 import { IExtensionApi, IMod } from '../../types/api';
-import { getSafe, showError, calcDuration } from '../../util/api';
+import { setApiKey } from '../../util/errorHandling';
+import github, { RateLimitExceeded } from '../../util/github';
 import { log } from '../../util/log';
+import { calcDuration, prettifyNodeErrorMessage, showError } from '../../util/message';
+import { activeGameId } from '../../util/selectors';
+import { getSafe } from '../../util/storeHelper';
 import { truthy } from '../../util/util';
+import { gameById, knownGames } from '../gamemode_management/selectors';
 import modName from '../mod_management/util/modName';
 import { setUserInfo } from './actions/persistent';
 import NXMUrl from './NXMUrl';
 import { checkModVersion } from './util/checkModsVersion';
-import { nexusGameId, convertNXMIdReverse, convertGameIdReverse } from './util/convertGameId';
+import { convertNXMIdReverse, nexusGameId } from './util/convertGameId';
 import sendEndorseMod from './util/endorseMod';
 import transformUserInfo from './util/transformUserInfo';
-import { gameById, knownGames } from '../gamemode_management/selectors';
-import { activeGameId } from '../../util/selectors';
 
 const UPDATE_CHECK_DELAY = 60 * 60 * 1000;
+
+const app = remote !== undefined ? remote.app : appIn;
 
 export function startDownload(api: IExtensionApi, nexus: Nexus, nxmurl: string): Promise<string> {
   let url: NXMUrl;
@@ -35,7 +43,7 @@ export function startDownload(api: IExtensionApi, nexus: Nexus, nxmurl: string):
   const state = api.store.getState();
   const games = knownGames(state);
   const gameId = convertNXMIdReverse(games, url.gameId);
-  const pageId = nexusGameId(gameById(state, gameId));
+  const pageId = nexusGameId(gameById(state, gameId), url.gameId);
 
   return Promise.resolve(nexus.getModInfo(url.modId, pageId))
     .then((modInfo: IModInfo) => {
@@ -52,9 +60,7 @@ export function startDownload(api: IExtensionApi, nexus: Nexus, nxmurl: string):
         displayMS: 4000,
       });
       return new Promise<string>((resolve, reject) => {
-        api.events.emit('start-download',
-          () => Promise.resolve(nexus.getDownloadURLs(url.modId, url.fileId, url.key, url.expires, pageId))
-                    .map((res: IDownloadURL) => res.URI), {
+        api.events.emit('start-download', [nxmurl], {
           game: gameId,
           source: 'nexus',
           name: nexusFileInfo.name,
@@ -89,13 +95,41 @@ export function startDownload(api: IExtensionApi, nexus: Nexus, nxmurl: string):
       return downloadId;
     })
     .catch((err) => {
-      api.sendNotification({
-        id: url.fileId.toString(),
-        type: 'global',
-        title: 'Download failed',
-        message: err.message,
-        displayMS: 2000,
-      });
+      if (err.message === 'Provided key and expire time isn\'t correct for this user/file.') {
+        const userName = getSafe(state, ['persistent', 'nexus', 'userInfo', 'name'], undefined);
+        const t = api.translate;
+        api.sendNotification({
+          id: url.fileId.toString(),
+          type: 'warning',
+          title: 'Download failed',
+          message: userName === undefined
+            ? t('You need to be logged in to Nexus Mods.')
+            : t('The link was not created for this account ({{ userName }}). You have to be logged '
+                + 'into nexusmods.com with the same account that you use in Vortex.', {
+            replace: {
+              userName,
+            },
+          }),
+          localize: {
+            message: false,
+          },
+        });
+      } else if (err instanceof RateLimitError) {
+        api.sendNotification({
+          id: 'rate-limit-exceeded',
+          type: 'warning',
+          title: 'Rate-limit exceeded',
+          message: 'You wont be able to use network features until the next full hour.',
+        });
+      } else {
+        api.sendNotification({
+          id: url.fileId.toString(),
+          type: 'global',
+          title: 'Download failed',
+          message: err.message,
+          displayMS: 2000,
+        });
+      }
       log('warn', 'failed to get mod info', { err: util.inspect(err) });
       return undefined;
     });
@@ -147,7 +181,7 @@ export function processErrorMessage(err: NexusError): IRequestError {
       message: 'Unexpected error reported by the server',
       Servermessage: (errorMessage || '') + ' ( Status Code: ' + err.statusCode + ')',
       URL: err.request,
-      stack: err.stack
+      stack: err.stack,
     };
   }
 }
@@ -159,7 +193,8 @@ function resolveEndorseError(t: I18next.TranslationFunction, err: Error): string
   } else if ((err as any).statusCode === 403) {
     const msg = {
       NOT_DOWNLOADED_MOD: 'You have not downloaded this mod from Nexus Mods yet.',
-      TOO_SOON_AFTER_DOWNLOAD: 'You have to wait 15 minutes after downloading a mod before you can endorse it.',
+      TOO_SOON_AFTER_DOWNLOAD: 'You have to wait 15 minutes after downloading a '
+                             + 'mod before you can endorse it.',
       IS_OWN_MOD: 'You can\'t endorse your own mods.',
     }[err.message];
     if (msg !== undefined) {
@@ -244,6 +279,12 @@ export function endorseModImpl(
     });
 }
 
+function nexusLink(mod: IMod, gameMode: string) {
+  const gameId = getSafe(mod.attributes, ['downloadGame'], undefined) || gameMode;
+  const nexusModId: number = parseInt(getSafe(mod.attributes, ['modId'], undefined), 10);
+  return `https://www.nexusmods.com/${gameId}/mods/${nexusModId}`;
+}
+
 export function checkModVersionsImpl(
   store: Redux.Store<any>,
   nexus: Nexus,
@@ -260,7 +301,6 @@ export function checkModVersionsImpl(
     ;
 
   log('info', 'checking mods for update (nexus)', { count: modsList.length });
-  const {TimeoutError} = require('nexus-api');
 
   return Promise.map(modsList, mod =>
     checkModVersion(store, nexus, gameId, mod)
@@ -282,9 +322,11 @@ export function checkModVersionsImpl(
         }
 
         const name = modName(mod, { version: true });
+        const nameLink = `[url=${nexusLink(mod, gameId)}]${name}[/url]`;
+
         return (detail.Servermessage !== undefined)
-          ? `${name}:\n${detail.message}\nServer said: "${detail.Servermessage}"`
-          : `${name}:\n${detail.message}`;
+          ? `${nameLink}:<br/>${detail.message}<br/>Server said: "${detail.Servermessage}"<br/>`
+          : `${nameLink}:<br/>${detail.message}`;
       }), { concurrency: 4 })
     .then((errorMessages: string[]): string[] => errorMessages.filter(msg => msg !== undefined));
 }
@@ -296,12 +338,34 @@ function errorFromNexusError(err: NexusError): string {
   }
 }
 
-export function validateKey(api: IExtensionApi, nexus: Nexus, key: string): Promise<void> {
-  return Promise.resolve(nexus.validateKey(key))
+export function updateKey(api: IExtensionApi, nexus: Nexus, key: string): Promise<void> {
+  setApiKey(key);
+  return Promise.resolve(nexus.setKey(key))
     .then(userInfo => {
-      api.store.dispatch(setUserInfo(transformUserInfo(userInfo)));
-      retrieveNexusGames(nexus);
+      if (userInfo !== null) {
+        api.store.dispatch(setUserInfo(transformUserInfo(userInfo)));
+        retrieveNexusGames(nexus);
+      }
+      return github.fetchConfig('api');
+    }).then(configObj => {
+      const currentVer = app.getVersion();
+      if ((currentVer !== '0.0.1')
+          && (semver.lt(currentVer, configObj.minversion))) {
+        (nexus as any).disable();
+        api.sendNotification({
+          type: 'warning',
+          title: 'Vortex outdated',
+          message: 'Your version of Vortex is quite outdated. Network features disabled.',
+          actions: [
+            { title: 'Check for update', action: () => {
+              ipcRenderer.send('check-for-updates', 'stable');
+            } },
+          ],
+        });
+      }
     })
+    // don't stop the login just because the github rate limit is exceeded
+    .catch(RateLimitExceeded, () => Promise.resolve())
     .catch(TimeoutError, () => {
       showError(api.store.dispatch,
         'API Key validation timed out',
@@ -316,16 +380,18 @@ export function validateKey(api: IExtensionApi, nexus: Nexus, key: string): Prom
       api.store.dispatch(setUserInfo(undefined));
     })
     .catch(err => {
+      const t = api.translate;
+      const pretty = prettifyNodeErrorMessage(err);
       // if there is an "errno", this is more of a technical problem, like
       // network is offline or server not reachable
       api.sendNotification({
         type: 'error',
         title: err.code === 'ESOCKETTIMEDOUT' ? undefined : 'Failed to log in',
         message: err.code ===  'ESOCKETTIMEDOUT'
-          ? 'Connection to nexusmods.com timed out, please check your internet connection'
-          : err.message,
+          ? t('Connection to nexusmods.com timed out, please check your internet connection')
+          : t(pretty.message, { replace: pretty.replace }),
         actions: [
-          { title: 'Retry', action: dismiss => { validateKey(api, nexus, key); dismiss(); } },
+          { title: 'Retry', action: dismiss => { updateKey(api, nexus, key); dismiss(); } },
         ],
       });
       api.store.dispatch(setUserInfo(undefined));

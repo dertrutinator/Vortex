@@ -5,7 +5,7 @@ import Advanced from '../../../controls/Advanced';
 import ToolbarIcon from '../../../controls/ToolbarIcon';
 import { IState } from '../../../types/IState';
 import { ComponentEx, connect, translate } from '../../../util/ComponentEx';
-import { UserCanceled } from '../../../util/CustomErrors';
+import { TemporaryError, UserCanceled } from '../../../util/CustomErrors';
 import { showError } from '../../../util/message';
 import { activeGameId } from '../../../util/selectors';
 import { getSafe } from '../../../util/storeHelper';
@@ -44,14 +44,13 @@ class DeactivationButton extends ComponentEx<IProps, {}> {
     const { t, activator, buttonType } = this.props;
 
     return (
-      <Advanced><ToolbarIcon
+      <ToolbarIcon
         id='purge-mods'
         icon='purge'
         text={t('Purge Mods')}
         onClick={activator !== undefined ? this.activate : nop}
         disabled={activator === undefined}
-      /></Advanced>
-    );
+      />);
   }
 
   private activate = () => {
@@ -68,12 +67,14 @@ class DeactivationButton extends ComponentEx<IProps, {}> {
         });
       }))
       .catch(UserCanceled, () => null)
+      .catch(TemporaryError, err =>
+        onShowError('Failed to purge mods, please try again', err.message, false))
       .catch(NoDeployment, () => {
         onShowError('You need to select a deployment method in settings',
                     undefined, false);
       })
       .catch(err => {
-        onShowError('Failed to purge mods', err);
+        onShowError('Failed to purge mods', err, err.code !== 'ENOTFOUND');
       });
   }
 

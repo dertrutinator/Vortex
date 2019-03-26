@@ -1,3 +1,4 @@
+import { IExtensionApi } from '../../../types/IExtensionContext';
 import { log } from '../../../util/log';
 import { getSafe } from '../../../util/storeHelper';
 import { truthy } from '../../../util/util';
@@ -9,7 +10,8 @@ import { IMod } from '../../mod_management/types/IMod';
 
 import * as Promise from 'bluebird';
 import * as I18next from 'i18next';
-import NexusT, { IFileInfo, IFileUpdate, IModFiles, IModInfo, NexusError } from 'nexus-api';
+import NexusT, { IFileInfo, IFileUpdate, IModFiles, IModInfo,
+                 NexusError, RateLimitError } from 'nexus-api';
 import * as Redux from 'redux';
 import * as semvish from 'semvish';
 
@@ -49,12 +51,9 @@ export function checkModVersion(store: Redux.Store<any>, nexus: NexusT,
  */
 function findLatestUpdate(fileUpdates: IFileUpdate[], updateChain: IFileUpdate[], fileId: number) {
   const updatedFile = fileUpdates.find(file => file.old_file_id === fileId);
-  if (updatedFile !== undefined) {
-    return findLatestUpdate(fileUpdates,
-      updateChain.concat([ updatedFile ]), updatedFile.new_file_id);
-  } else {
-    return updateChain;
-  }
+  return (updatedFile !== undefined)
+    ? findLatestUpdate(fileUpdates, updateChain.concat([ updatedFile ]), updatedFile.new_file_id)
+    : updateChain;
 }
 
 function update(dispatch: Redux.Dispatch<any>,
@@ -96,6 +95,13 @@ function updateLatestFileAttributes(dispatch: Redux.Dispatch<any>,
   } else {
     update(dispatch, gameId, mod, 'newestFileId', file.file_id);
   }
+}
+
+function setNoUpdateAttributes(dispatch: Redux.Dispatch<any>,
+                               gameId: string,
+                               mod: IMod) {
+  update(dispatch, gameId, mod, 'newestVersion', undefined);
+  update(dispatch, gameId, mod, 'newestFileId', undefined);
 }
 
 function updateFileAttributes(dispatch: Redux.Dispatch<any>,
@@ -142,10 +148,14 @@ function updateFileAttributes(dispatch: Redux.Dispatch<any>,
   if ((updatedFile === undefined) && truthy(mod.attributes.version)) {
     try {
       updatedFile = files.files.find(file => semvish.eq(file.mod_version, mod.attributes.version));
-    } catch(err) {}
+    } catch (err) {
+      // nop
+    }
   }
   if (updatedFile !== undefined) {
     updateLatestFileAttributes(dispatch, gameId, mod, updatedFile);
+  } else {
+    setNoUpdateAttributes(dispatch, gameId, mod);
   }
 }
 
@@ -160,11 +170,12 @@ function errorFromNexus(err: NexusError): Error {
 }
 
 export function retrieveModInfo(
-  nexus: NexusT,
-  store: Redux.Store<any>,
-  gameMode: string,
-  mod: IMod,
-  t: I18next.TranslationFunction): Promise<void> {
+    nexus: NexusT,
+    api: IExtensionApi,
+    gameMode: string,
+    mod: IMod,
+    t: I18next.TranslationFunction): Promise<void> {
+  const store = api.store;
   const nexusModId: string = getSafe(mod.attributes, ['modId'], undefined);
   if ((nexusModId === undefined) || (nexusModId.length === 0)) {
     return Promise.resolve();
@@ -172,11 +183,20 @@ export function retrieveModInfo(
   const gameId = getSafe(mod.attributes, ['downloadGame'], gameMode);
   const nexusIdNum = parseInt(nexusModId, 10);
   // if the endorsement state is unknown, request it
-  return Promise.resolve(nexus.getModInfo(nexusIdNum, nexusGameId(gameById(store.getState(), gameId))))
+  return Promise.resolve(nexus.getModInfo(nexusIdNum,
+                                          nexusGameId(gameById(store.getState(), gameId))))
     .then((modInfo: IModInfo) => {
       if (modInfo !== undefined) {
         updateModAttributes(store.dispatch, gameMode, mod, modInfo);
       }
+    })
+    .catch(RateLimitError, err => {
+      api.sendNotification({
+        id: 'rate-limit-exceeded',
+        type: 'warning',
+        title: 'Rate-limit exceeded',
+        message: 'You wont be able to use network features until the next full hour.',
+      });
     })
     .catch((err: NexusError) => {
       if (err.statusCode === 404) {

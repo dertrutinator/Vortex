@@ -1,8 +1,10 @@
+import { IExtensionApi } from '../../../types/IExtensionContext';
 import { Normalize } from '../../../util/getNormalizeFunc';
 import { IMod } from './IMod';
 
 import * as Promise from 'bluebird';
 import * as I18next from 'i18next';
+import i18next = require('i18next');
 
 /**
  * details about a file change
@@ -31,6 +33,14 @@ export interface IFileChange {
    * srcdeleted means that the file was deleted in the source directory
    */
   changeType: 'refchange' | 'valchange' | 'deleted' | 'srcdeleted';
+  /**
+   * time the deployed file was last changed
+   */
+  destTime?: Date;
+  /**
+   * time the staging file was last changed
+   */
+  sourceTime?: Date;
 }
 
 export interface IDeployedFile {
@@ -54,6 +64,31 @@ export interface IDeployedFile {
   time: number;
   // TODO: implement md5-hash in case file time is found to be an insufficient
   //   criterium
+}
+
+/**
+ * Indicates why a deployment method is unavailable an if it can be made to work
+ */
+export interface IUnavailableReason {
+  /**
+   * description (english) why the deployment method is unavailable
+   */
+  description: (t: i18next.TranslationFunction) => string;
+  /**
+   * describes the solution to make this
+   */
+  solution?: (t: i18next.TranslationFunction) => string;
+  /**
+   * if the problem can be fixed automatically, this can be set to a function that takes care
+   * of it
+   */
+  fixCallback?: (api: IExtensionApi) => Promise<void>;
+  /**
+   * When no method is supported, Vortex will offer possible solutions in this order.
+   * It should indicate both how much effort the solution is and also a general preference for
+   * this deployment methods so that the preferred method has a lower order number than others.
+   */
+  order?: number;
 }
 
 export interface IDeploymentMethod {
@@ -85,7 +120,7 @@ export interface IDeploymentMethod {
   /**
    * true if it's "safe" to purge files from this method from another instance,
    * that is: without knowing where the "original" files are.
-   * 
+   *
    * @type {boolean}
    * @memberOf IModActivator
    */
@@ -108,7 +143,7 @@ export interface IDeploymentMethod {
    *
    * @memberOf IModActivator
    */
-  isSupported: (state: any, gameId: string, modTypeId: string) => string;
+  isSupported: (state: any, gameId: string, modTypeId: string) => IUnavailableReason;
 
   /**
    * if mod deployment in some way requires user interaction we should give the user control
@@ -157,11 +192,22 @@ export interface IDeploymentMethod {
              progressCB?: (files: number, total: number) => void) => Promise<IDeployedFile[]>;
 
   /**
+   * if defined, this gets called instead of finalize if an error occurred since prepare was called.
+   * This allows the deployment method to reset all state without actually doing anything in case
+   * things went wrong.
+   * If this is not defined, nothing gets called. In this case the deployment method can't have any
+   * state set up in prepare that would cause issues if finalize doesn't get called.
+   */
+  cancel?: (gameId: string,
+            dataPath: string,
+            installationPath: string) => Promise<void>;
+
+  /**
    * activate the specified mod in the specified location
    * @param {string} sourcePath source where the mod is installed
    * @param {string} sourceName name to be stored as the source of files. usually the path of the
    *                            mod subdirectory
-   * @param {string} dataPath game path where mods are installed to (destination)
+   * @param {string} dataPath relative path within the data path where mods are installed to
    * @param {Set<string>} blacklist list of files to skip
    *
    * @memberOf IModActivator
@@ -171,8 +217,18 @@ export interface IDeploymentMethod {
 
   /**
    * deactivate the specified mod, removing all files it has deployed to the destination
+   * @param {string} sourcePath source where the mod is installed
+   * @param {string} dataPath relative path within the data path where mods are installed to
    */
-  deactivate: (installPath: string, dataPath: string, mod: IMod) => Promise<void>;
+  deactivate: (sourcePath: string, dataPath: string) => Promise<void>;
+
+  /**
+   * called before mods are being purged. If multiple mod types are going to be purged,
+   * this is only called once.
+   * This is primarily useful for optimization, to avoid work being done redundantly
+   * for every modtype-purge
+   */
+  prePurge: (installPath: string) => Promise<void>;
 
   /**
    * deactivate all mods at the destination location
@@ -186,6 +242,13 @@ export interface IDeploymentMethod {
    * @memberOf IModActivator
    */
   purge: (installPath: string, dataPath: string) => Promise<void>;
+
+  /**
+   * called after mods were purged. If multiple mod types wer purged, this is only called
+   * after they are all done.
+   * Like prePurge, this is intended for optimizations
+   */
+  postPurge: () => Promise<void>;
 
   /**
    * retrieve list of external changes, that is: files that were installed by this

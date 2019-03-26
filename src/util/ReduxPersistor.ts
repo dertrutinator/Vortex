@@ -1,5 +1,6 @@
 import {IPersistor} from '../types/IExtensionContext';
 import { terminate } from '../util/errorHandling';
+import { log } from '../util/log';
 
 import * as Promise from 'bluebird';
 import * as Redux from 'redux';
@@ -11,6 +12,11 @@ function insert(target: any, key: string[], value: any, hive: string) {
         // this could cause an exception if prev isn't an object, but only if
         // we previously stored incorrect data. We'd want to fix the error that
         // caused that, so we allow the exception to bubble up
+        if (typeof prev !== 'object') {
+          log('error', 'invalid application state',
+              { key: fullKey.slice(0, idx).join('.'), was: prev });
+          prev = {};
+        }
         prev[keySegment] = value;
         return prev;
       } else {
@@ -47,9 +53,7 @@ class ReduxPersistor<T> {
     return this.resetData(hive, persistor)
         .then(() => {
           this.mPersistors[hive] = persistor;
-          persistor.setResetCallback(() => {
-            this.resetData(hive, persistor);
-          });
+          persistor.setResetCallback(() => this.resetData(hive, persistor));
         });
   }
 
@@ -68,9 +72,11 @@ class ReduxPersistor<T> {
           type: '__hydrate',
           payload: { [hive]: res },
         });
-        this.storeDiff(persistor, [], res, this.mStore.getState()[hive]);
-        this.mHydrating.delete(hive);
-        return Promise.resolve();
+        return this.storeDiff(persistor, [], res, this.mStore.getState()[hive])
+          .then(() => {
+            this.mHydrating.delete(hive);
+            return Promise.resolve();
+          });
       });
   }
 
@@ -103,14 +109,30 @@ class ReduxPersistor<T> {
       return Promise.resolve();
     }
     this.mPersistedState = newState;
+
+    return this.ensureStoreDiffHive(oldState, newState);
+  }
+
+  private ensureStoreDiffHive(oldState: any, newState: any) {
     return this.storeDiffHive(oldState, newState)
       .catch(err => {
         // Only way this has ever gone wrong during alpha is when the disk
         // is full, which is nothing we can fix.
-        terminate({
-          message: 'Failed to store application state',
-          stack: err.stack,
-        }, undefined, false);
+        if (err.stack.indexOf('not enough space on the disk') !== -1) {
+          terminate({
+            message: 'There is not enough space on the disk, Vortex needs to quit now to '
+                   + 'ensure you\'re not losing further work. Please free up some space, '
+                   + 'then restart Vortex.',
+          }, undefined, false);
+          // If we get here, the user has ignored us. What an idiot.
+          // Oh well, try to retry the store,otherwise things will just get worse.
+          return this.ensureStoreDiffHive(oldState, newState);
+        } else {
+          terminate({
+            message: 'Failed to store application state',
+            stack: err.stack,
+          }, undefined, true);
+        }
       });
   }
 
@@ -151,15 +173,15 @@ class ReduxPersistor<T> {
             : this.storeDiff(persistor, [].concat(statePath, key), oldState[key], newState[key]))
           .then(() => Promise.mapSeries(newkeys,
             key => ((oldState[key] === undefined) && (newState[key] !== undefined))
-                // keys that exist in newState but not oldState
+              // keys that exist in newState but not oldState
               ? this.add(persistor, [].concat(statePath, key), newState[key])
-                // keys that exist in both - already handled above
+              // keys that exist in both - already handled above
               : Promise.resolve()))
           .then(() => undefined);
-      } else { 
+      } else {
         return (newState !== undefined)
           ? this.add(persistor, statePath, newState)
-          : this.remove(persistor, statePath, oldState)
+          : this.remove(persistor, statePath, oldState);
       }
     } catch (err) {
       return Promise.reject(err);

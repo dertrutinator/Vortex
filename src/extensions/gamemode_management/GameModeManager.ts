@@ -125,7 +125,12 @@ class GameModeManager {
       return Promise.resolve();
     } else {
       try {
-        return game.setup(gameDiscovery);
+        return fs.statAsync(gameDiscovery.path)
+          .then(() => game.setup(gameDiscovery))
+          .catch(err => (err.code === 'ENOENT')
+            ? Promise.reject(new ProcessCanceled(
+              `Game folder \"${gameDiscovery.path}\" doesn\'t exist (any more).`))
+            : Promise.reject(err));
       } catch (err) {
         return Promise.reject(err);
       }
@@ -147,6 +152,10 @@ class GameModeManager {
                           this.onDiscoveredGame, this.onDiscoveredTool);
   }
 
+  public isSearching(): boolean {
+    return this.mActiveSearch !== null;
+  }
+
   /**
    * start game discovery using known files
    *
@@ -156,18 +165,24 @@ class GameModeManager {
     const progressCallback = (idx: number, percent: number, label: string) =>
             this.mStore.dispatch(discoveryProgress(idx, percent, label));
 
-    const { searchPaths } = this.mStore.getState().settings.gameMode;
+    const state: IState = this.mStore.getState();
+    const { searchPaths } = state.settings.gameMode;
 
     if (!Array.isArray(searchPaths)) {
       throw new Error('invalid search paths: ' + require('util').inspect(searchPaths));
+    }
+
+    if (state.session.discovery.running) {
+      // already scanning
+      return;
     }
 
     this.mStore.dispatch(setPhaseCount(searchPaths.length));
 
     this.mActiveSearch = searchDiscovery(
       this.mKnownGames,
-      this.mStore.getState().settings.gameMode.discovered,
-      searchPaths,
+      state.settings.gameMode.discovered,
+      searchPaths.slice().sort(),
       this.onDiscoveredGame,
       this.onDiscoveredTool,
       this.onError,
@@ -211,6 +226,7 @@ class GameModeManager {
       id: game.id,
       logo: game.logo,
       extensionPath: game.extensionPath,
+      parameters: game.parameters || [],
       requiredFiles: game.requiredFiles,
       supportedTools: game.supportedTools !== undefined
         ? game.supportedTools.map(this.storeTool)
@@ -219,6 +235,8 @@ class GameModeManager {
       environment: game.environment,
       details: game.details,
       shell: game.shell,
+      contributed: game.contributed,
+      final: game.final,
     };
   }
 

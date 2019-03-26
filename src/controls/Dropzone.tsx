@@ -1,6 +1,9 @@
-import { DialogActions, DialogType, IDialogContent,
-         IDialogResult, showDialog } from '../actions/notifications';
+import { DialogActions, DialogType, IConditionResult, IDialogContent,
+         IDialogResult, IInput, showDialog } from '../actions/notifications';
+
+import { IState } from '../types/IState';
 import { ComponentEx, connect, translate } from '../util/ComponentEx';
+import { truthy } from '../util/util';
 
 import Icon from './Icon';
 
@@ -9,7 +12,7 @@ import * as Promise from 'bluebird';
 import * as React from 'react';
 import * as Redux from 'redux';
 import { ThunkDispatch } from 'redux-thunk';
-import { IState } from '../types/IState';
+import * as url from 'url';
 
 export type DropType = 'urls' | 'files';
 
@@ -137,9 +140,8 @@ class Dropzone extends ComponentEx<IProps, IComponentState> {
   }
 
   private onDragEnter = (evt: React.DragEvent<any>) => {
-    if (evt.preventDefault()) {
-      this.setDropMode(evt);
-    }
+    evt.preventDefault();
+    this.setDropMode(evt);
   }
 
   private onDragOver = (evt: React.DragEvent<any>) => {
@@ -187,9 +189,9 @@ class Dropzone extends ComponentEx<IProps, IComponentState> {
     const { accept, drop } = this.props;
     evt.preventDefault();
 
-    const url = evt.dataTransfer.getData('Url');
-    if ((url !== '') && (accept.indexOf('urls') !== -1)) {
-      drop('urls', [url]);
+    const dropUrl = evt.dataTransfer.getData('Url');
+    if ((dropUrl !== '') && (accept.indexOf('urls') !== -1)) {
+      drop('urls', [dropUrl]);
     }
 
     if ((evt.dataTransfer.files.length > 0) && (accept.indexOf('files') !== -1)) {
@@ -223,10 +225,16 @@ class Dropzone extends ComponentEx<IProps, IComponentState> {
           type: 'url',
           value: dialogDefault,
         }],
-      }, [ { label: 'Cancel' }, { label: 'Download' } ])
+        condition: this.validateURL,
+      }, [ { label: 'Cancel' }, { label: 'Download', default: true } ])
       .then(result => {
           if (result.action === 'Download') {
-            this.props.drop('urls', [result.input.url]);
+            let inputUrl = result.input.url;
+            if (!truthy(url.parse(inputUrl).protocol)) {
+              // no protocol specified
+              inputUrl = 'https://' + inputUrl;
+            }
+            this.props.drop('urls', [inputUrl]);
           }
         });
     } else {
@@ -239,6 +247,24 @@ class Dropzone extends ComponentEx<IProps, IComponentState> {
         }
       });
     }
+  }
+
+  private hasEmptyInput = (input: IInput): IConditionResult => {
+    const { t } = this.props;
+    return (input.value === undefined) || ((input.value === ''))
+      ? {
+          id: input.id || 'url',
+          actions: ['Download'],
+          errorText: t('{{label}} cannot be empty.', {
+            replace: { label: input.label ? input.label : 'Field' },
+          }),
+        }
+      : undefined;
+  }
+
+  private validateURL = (content: IDialogContent): IConditionResult[] => {
+    const urlInput = content.input.find(inp => inp.id === 'url');
+    return [this.hasEmptyInput(urlInput)].filter(res => res !== undefined);
   }
 }
 

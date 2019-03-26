@@ -1,9 +1,9 @@
 import { DialogActions, DialogType, IDialogContent, IDialogResult,
          showDialog } from '../../../actions/notifications';
-import Icon from '../../../controls/Icon';
 import { IState } from '../../../types/IState';
 import { ComponentEx, connect, translate } from '../../../util/ComponentEx';
 import * as fs from '../../../util/fs';
+import { log } from '../../../util/log';
 import { activeGameId } from '../../../util/selectors';
 import { getSafe } from '../../../util/storeHelper';
 import MainPage from '../../../views/MainPage';
@@ -23,7 +23,7 @@ import { remote } from 'electron';
 import update from 'immutability-helper';
 import * as path from 'path';
 import * as React from 'react';
-import { Button, Collapse, ListGroup, ListGroupItem, Panel } from 'react-bootstrap';
+import { Button, Collapse } from 'react-bootstrap';
 import { generate as shortid } from 'shortid';
 
 export interface IBaseProps {
@@ -37,6 +37,7 @@ interface IConnectedProps {
   language: string;
   games: IGameStored[];
   discoveredGames: { [gameId: string]: IDiscoveryResult };
+  activity: string[];
 }
 
 interface IActionProps {
@@ -74,13 +75,18 @@ class ProfileView extends ComponentEx<IProps, IViewState> {
   }
 
   public render(): JSX.Element {
-    const { t, discoveredGames, features, gameId, games, language, profiles } = this.props;
+    const { t, activity, features, gameId, language, profiles } = this.props;
     const { edit, showOther } = this.state;
 
     const currentGameProfiles: { [id: string]: IProfile } = {};
     const otherProfiles: { [id: string]: IProfile } = {};
 
     Object.keys(profiles).forEach(profileId => {
+      if ((profiles[profileId].gameId === undefined)
+          || (profiles[profileId].name === undefined)) {
+        return;
+      }
+
       if (profiles[profileId].gameId === gameId) {
         currentGameProfiles[profileId] = profiles[profileId];
       } else {
@@ -91,13 +97,11 @@ class ProfileView extends ComponentEx<IProps, IViewState> {
     const currentGameProfilesSorted = this.sortProfiles(currentGameProfiles, language);
     const otherProfilesSorted = this.sortProfiles(otherProfiles, language);
 
+    const isDeploying = activity.indexOf('deployment') !== -1;
+
     // const sortedProfiles: string[] = this.sortProfiles(profiles, language);
 
     const supportedFeatures = features.filter(feature => feature.supported());
-
-    const game = games.find((iter: IGameStored) => iter.id === gameId);
-    const discovered = discoveredGames[gameId];
-    const gameName = getSafe(discovered, ['name'], getSafe(game, ['name'], ''));
 
     return (
       <MainPage>
@@ -120,15 +124,25 @@ class ProfileView extends ComponentEx<IProps, IViewState> {
               </div>
             </div>
           </Collapse>
+          {isDeploying ? this.renderOverlay() : null}
         </MainPage.Body>
       </MainPage>
+    );
+  }
+
+  private renderOverlay(): JSX.Element {
+    const {t} = this.props;
+    return (
+      <div className='profile-overlay'>
+        {t('Deployment in progress')}
+      </div>
     );
   }
 
   private sortProfiles(profiles: { [id: string]: IProfile }, language: string) {
     return Object.keys(profiles).sort(
       (lhs: string, rhs: string): number =>
-        profiles[lhs].gameId !== profiles[rhs].gameId
+        (profiles[lhs].gameId !== profiles[rhs].gameId)
           ? profiles[lhs].gameId.localeCompare(profiles[rhs].gameId)
           : profiles[lhs].name.localeCompare(profiles[rhs].name, language,
             { sensitivity: 'base' }));
@@ -270,11 +284,14 @@ class ProfileView extends ComponentEx<IProps, IViewState> {
     .then(() => {
       onAddProfile(newProfile);
       this.editExistingProfile(newProfile.id);
-    });
+    })
+    .catch(err => this.context.api.showErrorNotification('Failed to clone profile',
+      err, { allowReport: err.code !== 'EPERM' }));
   }
 
   private onRemoveProfile = (profileId: string) => {
-    const { currentProfile, onRemoveProfile, onWillRemoveProfile, onSetNextProfile, onShowDialog, profiles } = this.props;
+    const { currentProfile, onRemoveProfile, onWillRemoveProfile, onSetNextProfile,
+            onShowDialog, profiles } = this.props;
     onShowDialog('question', 'Confirm', {
       text: 'Remove this profile? This can\'t be undone!',
     }, [
@@ -282,6 +299,7 @@ class ProfileView extends ComponentEx<IProps, IViewState> {
         {
           label: 'Remove', action:
             () => {
+              log('info', 'user removing profile', { id: profileId });
               onWillRemoveProfile(profileId);
               if (profileId === currentProfile) {
                 onSetNextProfile(undefined);
@@ -304,6 +322,8 @@ function profilePath(profile: IProfile): string {
   return path.join(remote.app.getPath('userData'), profile.gameId, 'profiles', profile.id);
 }
 
+const emptyArray = [];
+
 function mapStateToProps(state: IState): IConnectedProps {
   const gameId = activeGameId(state);
   return {
@@ -313,6 +333,7 @@ function mapStateToProps(state: IState): IConnectedProps {
     language: state.settings.interface.language,
     games: state.session.gameMode.known,
     discoveredGames: state.settings.gameMode.discovered,
+    activity: getSafe(state, ['session', 'base', 'activity', 'mods'], emptyArray),
   };
 }
 

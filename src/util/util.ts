@@ -3,6 +3,7 @@ import { IDialogResult } from '../types/IDialog';
 import { ThunkStore } from '../types/IExtensionContext';
 import { UserCanceled } from './CustomErrors';
 import delayed from './delayed';
+import { Normalize } from './getNormalizeFunc';
 import getVortexPath from './getVortexPath';
 import { log } from './log';
 
@@ -10,6 +11,7 @@ import * as Promise from 'bluebird';
 import { spawn } from 'child_process';
 import { createHash } from 'crypto';
 import * as fs from 'fs-extra-promise';
+import * as _ from 'lodash';
 import * as path from 'path';
 import { file } from 'tmp';
 
@@ -58,11 +60,27 @@ function checksum(input: string | Buffer): string {
     .digest('hex');
 }
 
-export function writeFileAtomic(filePath: string, data: string | Buffer,
+export function fileMD5(filePath: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const hash = createHash('md5');
+    const stream = fs.createReadStream(filePath);
+    stream.on('readable', () => {
+      const data = stream.read();
+      if (data) {
+        hash.update(data);
+      }
+    });
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+export function writeFileAtomic(filePath: string, input: string | Buffer,
                                 options?: fs.WriteFileOptions) {
+  const stackErr = new Error();
   let cleanup: () => void;
   let tmpPath: string;
-  const hash = checksum(data);
+  const hash = checksum(input);
   return new Promise<number>((resolve, reject) => {
     file({ template: `${filePath}.XXXXXX.tmp` },
          (err: any, genPath: string, fd: number, cleanupCB: () => void) => {
@@ -74,8 +92,13 @@ export function writeFileAtomic(filePath: string, data: string | Buffer,
       resolve(fd);
     });
   })
-  .then(fd => fs.closeAsync(fd))
-  .then(() => fs.writeFileAsync(tmpPath, data, options))
+  .then(fd => {
+    const buf: Buffer = input instanceof Buffer
+      ? input
+      : Buffer.from(input);
+    return fs.writeAsync(fd, buf, 0, buf.byteLength, 0)
+      .then(() => fs.closeAsync(fd));
+  })
   .tapCatch(() => {
     if (cleanup !== undefined) {
       cleanup();
@@ -85,7 +108,11 @@ export function writeFileAtomic(filePath: string, data: string | Buffer,
   .then(data => (checksum(data) !== hash)
       ? Promise.reject(new Error('Write failed, checksums differ'))
       : Promise.resolve())
-  .then(() => fs.renameAsync(tmpPath, filePath));
+  .then(() => fs.renameAsync(tmpPath, filePath))
+  .catch(err => {
+    err.stack = err.message + '\n' + stackErr.stack;
+    return Promise.reject(err);
+  });
 }
 
 /**
@@ -215,11 +242,14 @@ export function truthy(val: any): boolean {
  * @param lhs the left, "before", object
  * @param rhs the right, "after", object
  */
-export function objDiff(lhs: any, rhs: any): any {
+export function objDiff(lhs: any, rhs: any, skip?: string[]): any {
   const res = {};
 
   if ((typeof(lhs) === 'object') && (typeof(rhs) === 'object')) {
     Object.keys(lhs || {}).forEach(key => {
+      if ((skip !== undefined) && (skip.indexOf(key) !== -1)) {
+        return;
+      }
       if ((rhs[key] === undefined) && (lhs[key] !== undefined)) {
         res['-' + key] = lhs[key];
       } else {
@@ -316,17 +346,46 @@ export function decodeHTML(input: string): string {
   return convertDiv.innerText;
 }
 
+const PROP_BLACKLIST = ['constructor',
+  '__defineGetter__',
+  '__defineSetter__',
+  'hasOwnProperty',
+  '__lookupGetter__',
+  '__lookupSetter__',
+  'isPrototypeOf',
+  'propertyIsEnumerable',
+  'toString',
+  'valueOf',
+  '__proto__',
+  'toLocaleString' ];
+
+export function getAllPropertyNames(obj: object) {
+  let props: string[] = [];
+
+  while (obj !== null) {
+    const objProps = Object.getOwnPropertyNames(obj);
+    // don't want the properties of the "base" object
+    if (objProps.indexOf('__defineGetter__') !== -1) {
+      break;
+    }
+    props = props.concat(objProps);
+    obj = Object.getPrototypeOf(obj);
+  }
+
+  return Array.from(new Set(_.difference(props, PROP_BLACKLIST)));
+}
+
 /**
  * test if a directory is a sub-directory of another one
  * @param child path of the presumed sub-directory
  * @param parent path of the presumed parent directory
  */
-export function isChildPath(child: string, parent: string): boolean {
-  // TODO: should be using a FS-specific normalize function but then
-  //   this would have to be asynchronous.
-  const normalize = (input) => process.platform === 'win32'
-    ? path.normalize(input.toLowerCase())
-    : path.normalize(input);
+export function isChildPath(child: string, parent: string, normalize?: Normalize): boolean {
+  if (normalize === undefined) {
+    normalize = (input) => process.platform === 'win32'
+      ? path.normalize(input.toLowerCase())
+      : path.normalize(input);
+  }
 
   const childNorm = normalize(child);
   const parentNorm = normalize(parent);
@@ -338,4 +397,11 @@ export function isChildPath(child: string, parent: string): boolean {
   const childTokens = childNorm.split(path.sep).filter(token => token.length > 0);
 
   return tokens.every((token: string, idx: number) => childTokens[idx] === token);
+}
+
+/**
+ * take any input string and sanitize it into a valid css id
+ */
+export function sanitizeCSSId(input: string) {
+  return input.toLowerCase().replace(/[ .#]/g, '-');
 }

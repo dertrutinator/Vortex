@@ -14,6 +14,7 @@ import { IToolStored } from './IToolStored';
  */
 export interface IDiscoveryResult {
   path?: string;
+  pathSetManually?: boolean;
   tools?: {
     [id: string]: IToolStored;
   };
@@ -25,6 +26,7 @@ export interface IDiscoveryResult {
   name?: string;
   shortName?: string;
   executable?: string;
+  parameters?: string[];
   logo?: string;
   extensionPath?: string;
   mergeMods?: boolean;

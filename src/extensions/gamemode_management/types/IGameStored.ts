@@ -8,8 +8,11 @@ export interface IGameStored {
   extensionPath: string;
   requiredFiles: string[];
   executable: string;
+  parameters?: string[];
   supportedTools?: IToolStored[];
   environment?: { [key: string]: string };
   details?: { [key: string]: any };
   shell?: boolean;
+  contributed?: string;
+  final?: boolean;
 }

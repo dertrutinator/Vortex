@@ -15,9 +15,9 @@ import { DialogActions, DialogType, IDialogContent, IDialogResult } from '../../
 import { IState } from '../../../types/IState';
 import { ITableAttribute } from '../../../types/ITableAttribute';
 import { ComponentEx, connect, translate } from '../../../util/ComponentEx';
-import { ProcessCanceled, TemporaryError, UserCanceled } from '../../../util/CustomErrors';
+import { ProcessCanceled, UserCanceled } from '../../../util/CustomErrors';
 import Debouncer from '../../../util/Debouncer';
-import * as fs from '../../../util/fs';
+import * as selectors from '../../../util/selectors';
 import { getSafe } from '../../../util/storeHelper';
 import { truthy } from '../../../util/util';
 import MainPage from '../../../views/MainPage';
@@ -40,7 +40,6 @@ import VersionChangelogButton from '../views/VersionChangelogButton';
 import VersionIconButton from '../views/VersionIconButton';
 
 import { INSTALL_TIME, PICTURE } from '../modAttributes';
-import * as selectors from '../../../util/selectors';
 import getText from '../texts';
 
 import CheckModVersionsButton from './CheckModVersionsButton';
@@ -49,14 +48,12 @@ import InstallArchiveButton from './InstallArchiveButton';
 import * as Promise from 'bluebird';
 import * as I18next from 'i18next';
 import * as _ from 'lodash';
-import * as path from 'path';
 import * as React from 'react';
 import { Button, ButtonGroup, MenuItem, Panel } from 'react-bootstrap';
 import * as ReactDOM from 'react-dom';
 import * as Redux from 'redux';
 import { ThunkDispatch } from 'redux-thunk';
 import * as semver from 'semver';
-import { profileById } from '../../../util/selectors';
 
 const PanelX: any = Panel;
 
@@ -128,7 +125,9 @@ interface IActionProps {
 type IProps = IBaseProps & IConnectedProps & IActionProps;
 
 interface IComponentState {
-  bounds: ClientRect;
+  modsWithState: { [id: string]: IModWithState };
+  groupedMods: { [id: string]: IModWithState[] };
+  primaryMods: { [id: string]: IModWithState };
 }
 
 const nop = () => null;
@@ -145,9 +144,7 @@ class ModList extends ComponentEx<IProps, IComponentState> {
   private modVersionDetailAttribute: ITableAttribute;
   private modVariantDetailAttribute: ITableAttribute;
   private modAuthorAttribute: ITableAttribute<IModWithState>;
-  private mModsWithState: { [id: string]: IModWithState };
-  private mGroupedMods: { [id: string]: IModWithState[] } = {};
-  private mPrimaryMods: { [id: string]: IModWithState } = {};
+  private mAttributes: ITableAttribute[];
   private mUpdateDebouncer: Debouncer;
   private mLastUpdateProps: IModProps = { mods: {}, modState: {}, downloads: {} };
   private mIsMounted: boolean = false;
@@ -177,7 +174,8 @@ class ModList extends ComponentEx<IProps, IComponentState> {
         title: 'Remove',
         action: this.removeSelected,
         condition: instanceId => (typeof(instanceId) === 'string')
-            ? (['downloaded', 'installed'].indexOf(this.mModsWithState[instanceId].state) !== -1)
+            ? (['downloaded', 'installed']
+                .indexOf(this.state.modsWithState[instanceId].state) !== -1)
             : true,
         hotKey: { code: 46 },
       },
@@ -198,21 +196,30 @@ class ModList extends ComponentEx<IProps, IComponentState> {
         icon: 'start-install',
         title: 'Install',
         action: this.install,
-        condition: (instanceId: string) => this.props.mods[instanceId] === undefined,
+        condition: (instanceId: string | string[]) => {
+          const { mods } = this.props;
+          if (typeof(instanceId) === 'string') {
+            return mods[instanceId] === undefined;
+          } else {
+            return instanceId.find(id => mods[id] !== undefined) === undefined;
+          }
+        },
         position: 50,
       },
       {
         icon: 'start-install',
         title: 'Reinstall',
         action: this.reinstall,
-        condition: (instanceId: string) => {
-          if (this.props.mods[instanceId] === undefined) {
-            return false;
+        condition: (instanceId: string | string[]) => {
+          const cond = (id: string) => (this.props.mods[id] !== undefined)
+              && (truthy(this.props.mods[id].archiveId)
+                || this.props.t('No associated archive.'));
+          if (typeof(instanceId) === 'string') {
+            return cond(instanceId);
+          } else {
+            return instanceId.find(cond) !== undefined;
           }
-          return truthy(this.props.mods[instanceId].archiveId)
-               || this.props.t('No associated archive.');
         },
-        singleRowAction: true,
       },
     ];
 
@@ -223,23 +230,32 @@ class ModList extends ComponentEx<IProps, IComponentState> {
       },
       {
         component: CheckModVersionsButton,
-        props: () => ({groupedMods: this.mGroupedMods}),
+        props: () => ({groupedMods: this.state.groupedMods}),
       },
+    ];
+
+    this.mAttributes = [
+      PICTURE,
+      this.modEnabledAttribute,
+      this.modNameAttribute,
+      this.modVersionAttribute,
+      this.modAuthorAttribute,
+      this.modVersionDetailAttribute,
+      this.modVariantDetailAttribute,
+      INSTALL_TIME,
     ];
 
     this.mUpdateDebouncer = new Debouncer((newProps) => {
         this.updateModsWithState(newProps)
-          .then(() => {
-            if (this.mIsMounted) {
-              this.forceUpdate();
-            }
-          });
+          .then(() => null);
         return null;
       }, 500);
 
-    this.state = {
-      bounds: { top: 0, bottom: 0, height: 0, width: 0, left: 0, right: 0 },
-    };
+    this.initState({
+      modsWithState: {},
+      groupedMods: {},
+      primaryMods: {},
+    });
   }
 
   public componentWillMount() {
@@ -257,10 +273,6 @@ class ModList extends ComponentEx<IProps, IComponentState> {
 
   public componentWillUnmount() {
     this.mIsMounted = false;
-  }
-
-  public shouldComponentUpdate() {
-    return false;
   }
 
   public componentWillReceiveProps(newProps: IProps) {
@@ -281,13 +293,13 @@ class ModList extends ComponentEx<IProps, IComponentState> {
       return null;
     }
 
-    if (this.mGroupedMods === undefined) {
+    if (this.state.groupedMods === undefined) {
       return null;
     }
 
     let content: JSX.Element;
 
-    if (Object.keys(this.mPrimaryMods).length === 0) {
+    if (Object.keys(this.state.primaryMods).length === 0) {
       // for some reason I can't use the <Panel> control, it ends up
       // having no body
       content = (
@@ -310,17 +322,8 @@ class ModList extends ComponentEx<IProps, IComponentState> {
               tableId='mods'
               detailsTitle={t('Mod Attributes')}
 
-              data={this.mPrimaryMods}
-              staticElements={[
-                PICTURE,
-                this.modEnabledAttribute,
-                this.modNameAttribute,
-                this.modVersionAttribute,
-                this.modAuthorAttribute,
-                this.modVersionDetailAttribute,
-                this.modVariantDetailAttribute,
-                INSTALL_TIME,
-              ]}
+              data={this.state.primaryMods}
+              staticElements={this.mAttributes}
               actions={this.modActions}
             >
               {this.renderMoreMods(modSources)}
@@ -419,7 +422,7 @@ class ModList extends ComponentEx<IProps, IComponentState> {
   private calcVersion = (mod: IModWithState): string => {
     const { t } = this.props;
     const version = getSafe(mod.attributes, ['version'], undefined);
-    const equalMods = this.mGroupedMods[mod.id];
+    const equalMods = this.state.groupedMods[mod.id];
     if ((equalMods !== undefined) && (equalMods.length > 1)) {
       return version + ' (' + t('{{ count }} more', { count: equalMods.length - 1 }) + ')';
     } else {
@@ -429,7 +432,7 @@ class ModList extends ComponentEx<IProps, IComponentState> {
 
   private renderVersion = (mod: IModWithState): JSX.Element => {
     const { downloads, downloadPath, mods, t, gameMode } = this.props;
-    const equalMods = this.mGroupedMods[mod.id];
+    const equalMods = this.state.groupedMods[mod.id];
     const alternatives = equalMods !== undefined
       ? equalMods.map(iter => iter.id)
       : [mod.id];
@@ -502,8 +505,8 @@ class ModList extends ComponentEx<IProps, IComponentState> {
           key={altId}
           modId={modId}
           altId={altId}
-          mod={this.mModsWithState[altId]}
-          onRemove={this.removeMod}
+          mod={this.state.modsWithState[altId]}
+          onRemove={this.removeSelectedMod}
         />
       </li>
     );
@@ -662,7 +665,7 @@ class ModList extends ComponentEx<IProps, IComponentState> {
         };
         changed = true;
       } else {
-        newModsWithState[modId] = this.mModsWithState[modId];
+        newModsWithState[modId] = this.state.modsWithState[modId];
       }
     });
 
@@ -674,8 +677,8 @@ class ModList extends ComponentEx<IProps, IComponentState> {
         && (newProps.downloads[archiveId].state === 'finished')
         && !installedIds.has(archiveId)) {
         if ((oldProps.downloads[archiveId] === newProps.downloads[archiveId])
-          && (this.mModsWithState[archiveId] !== undefined)) {
-          newModsWithState[archiveId] = this.mModsWithState[archiveId];
+          && (this.state.modsWithState[archiveId] !== undefined)) {
+          newModsWithState[archiveId] = this.state.modsWithState[archiveId];
           return;
         }
         return filterModInfo({ download: newProps.downloads[archiveId] }, undefined)
@@ -703,17 +706,17 @@ class ModList extends ComponentEx<IProps, IComponentState> {
 
         // if the new mod list is a subset of the old one (including the empty set)
         // the above check wouldn't notice that change
-        if (!changed && ((this.mModsWithState === undefined)
-            || !_.isEqual(Object.keys(newModsWithState), Object.keys(this.mModsWithState)))) {
+        if (!changed && ((this.state.modsWithState === undefined)
+            || !_.isEqual(Object.keys(newModsWithState), Object.keys(this.state.modsWithState)))) {
           changed = true;
         }
 
-        if (changed || (this.mGroupedMods === undefined)) {
+        if (changed || (this.state.groupedMods === undefined)) {
           this.updateModGrouping(newModsWithState);
         }
 
         // assign only after mod grouping is updated so these don't go out of sync
-        this.mModsWithState = newModsWithState;
+        this.nextState.modsWithState = newModsWithState;
         this.mLastUpdateProps = newProps;
         return null;
       });
@@ -722,13 +725,13 @@ class ModList extends ComponentEx<IProps, IComponentState> {
   private cycleModState(profileId: string, modId: string, newValue: string) {
     const { gameMode, onSetModEnabled } = this.props;
 
-    if (this.mModsWithState[modId].state === 'downloaded') {
+    if (this.state.modsWithState[modId].state === 'downloaded') {
       // cycle from "not installed" -> "disabled"
       this.context.api.events.emit('start-install-download', modId);
     } else {
       // enabled and disabled toggle to each other so the toggle
       // will never remove the mod
-      if (this.mModsWithState[modId].enabled === true) {
+      if (this.state.modsWithState[modId].enabled === true) {
         onSetModEnabled(profileId, modId, false);
       } else {
         onSetModEnabled(profileId, modId, true);
@@ -739,33 +742,33 @@ class ModList extends ComponentEx<IProps, IComponentState> {
 
   private setModState(profileId: string, modId: string, value: string) {
     const { gameMode, onSetModEnabled } = this.props;
-    if (this.mModsWithState[modId] === undefined) {
+    const { modsWithState } = this.state;
+    if (modsWithState[modId] === undefined) {
       return;
     }
     // direct selection
     if (value === 'uninstalled') {
       // selected "not installed"
-      if (this.mModsWithState[modId].state !== 'downloaded') {
-        this.context.api.events.emit('remove-mod', gameMode, modId, (err) => {
-          if (err !== null) {
-            if (err instanceof UserCanceled) {
-              // the user knows that he cancelled, no need to notify
-              return;
-            } else if (err instanceof TemporaryError) {
-              return this.context.api.showErrorNotification(
-                'Failed to remove mod, please try again',
-                err.message, { allowReport: false });
-            } else if (err instanceof ProcessCanceled) {
-              return this.context.api.showErrorNotification('Failed to remove mod', err.message,
-                { allowReport: false });
-            } else {
-              return this.context.api.showErrorNotification('Failed to remove mod', err);
+      if (modsWithState[modId].state !== 'downloaded') {
+        this.removeMods([modId])
+        .then(() => null)
+        .catch(UserCanceled, () => null)
+        .catch(ProcessCanceled, err => {
+          this.context.api.sendNotification({
+            id: 'cant-remove-mod',
+            type: 'warning',
+            title: 'Failed to remove "{{modName}}"',
+            message: err.message,
+            replace: {
+              modName: modName(modsWithState[modId]),
             }
-          }
-          this.context.api.events.emit('mods-enabled', [modId], value, gameMode);
+          });
+        })
+        .catch(err => {
+          this.context.api.showErrorNotification('Failed to remove mod', err);
         });
       }
-    } else if (this.mModsWithState[modId].state === 'downloaded') {
+    } else if (modsWithState[modId].state === 'downloaded') {
       // selected "enabled" or "disabled" from "not installed" so first the mod
       // needs to be installed
       this.context.api.events.emit('start-install-download', modId, (err, id) => {
@@ -784,8 +787,8 @@ class ModList extends ComponentEx<IProps, IComponentState> {
   private changeModEnabled = (mod: IModWithState, value: any) => {
     const { profileId } = this.props;
 
-    if ((this.mModsWithState[mod.id] === undefined)
-        || (this.mModsWithState[mod.id].state === 'installing')) {
+    if ((this.state.modsWithState[mod.id] === undefined)
+        || (this.state.modsWithState[mod.id].state === 'installing')) {
       // can't change state while installing
       return;
     }
@@ -806,7 +809,7 @@ class ModList extends ComponentEx<IProps, IComponentState> {
       return prev;
     }, {});
 
-    this.mPrimaryMods = Object.keys(groupedMods).reduce(
+    this.nextState.primaryMods = Object.keys(groupedMods).reduce(
       (prev: { [id: string]: IModWithState }, value) => {
         const prim = groupedMods[value][0];
         prev[value] = prim;
@@ -815,7 +818,7 @@ class ModList extends ComponentEx<IProps, IComponentState> {
 
     // assign after primary mods are calculated so that in case of an error the two don't become
     // out of sync
-    this.mGroupedMods = groupedMods;
+    this.nextState.groupedMods = groupedMods;
   }
 
   private selectVersionClick = (event) => {
@@ -837,8 +840,8 @@ class ModList extends ComponentEx<IProps, IComponentState> {
     }
 
     onSetModEnabled(profileId, modId, false);
-    if ((this.mModsWithState[altId] !== undefined)
-        && (this.mModsWithState[altId].state === 'downloaded')) {
+    if ((this.state.modsWithState[altId] !== undefined)
+        && (this.state.modsWithState[altId].state === 'downloaded')) {
       this.context.api.events.emit('start-install-download', altId, (err, id) => {
         if (err === null) {
           onSetModEnabled(profileId, id, true);
@@ -878,34 +881,37 @@ class ModList extends ComponentEx<IProps, IComponentState> {
     });
   }
 
-  private removeMod = (modId: string) => {
-    this.removeSelected([modId]);
+  private removeMod(modId: string): Promise<void> {
+    const { gameMode } = this.props;
+    return new Promise((resolve, reject) => {
+      this.context.api.events.emit('remove-mod', gameMode, modId, err => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
   }
 
   private removeMods(modIds: string[]): Promise<void> {
-    const { installPath, mods } = this.props;
-
-    this.disableModsInner(modIds);
-    return new Promise<void>((resolve, reject) => {
-      this.context.api.events.emit('deploy-mods', (err: Error) => {
-        if (err === null) {
-          resolve();
+    const { gameMode } = this.props;
+    const { modsWithState } = this.state;
+    return Promise
+      .mapSeries(modIds, modId => {
+        if (modsWithState[modId].state === 'installed') {
+          return this.removeMod(modId);
         } else {
-          reject(err);
+          return Promise.resolve();
         }
+      })
+      .then(() => {
+        this.context.api.events.emit('mods-enabled', modIds, true, gameMode);
       });
-    })
-      .then(() => Promise.map(modIds, key =>
-        ((mods[key] !== undefined)
-         && truthy(mods[key].installationPath)
-         && (['downloaded', 'installed'].indexOf(mods[key].state) !== -1))
-          ? fs.removeAsync(path.join(installPath, mods[key].installationPath))
-              .catch(UserCanceled, () => undefined)
-              .catch(err => {
-                this.context.api.showErrorNotification('Failed to remove mod', err);
-              })
-            : Promise.resolve())
-        .then(() => undefined));
+  }
+
+  private removeSelectedMod = (modId: string) => {
+    this.removeSelected([modId]);
   }
 
   private removeSelected = (modIds: string[]) => {
@@ -915,9 +921,9 @@ class ModList extends ComponentEx<IProps, IComponentState> {
     let removeArchive: boolean;
 
     const filteredIds = modIds
-      .filter(modId => this.mModsWithState[modId] !== undefined)
+      .filter(modId => this.state.modsWithState[modId] !== undefined)
       .filter(modId =>
-        ['downloaded', 'installed'].indexOf(this.mModsWithState[modId].state) !== -1);
+        ['downloaded', 'installed'].indexOf(this.state.modsWithState[modId].state) !== -1);
 
     if (filteredIds.length === 0) {
       return;
@@ -926,10 +932,10 @@ class ModList extends ComponentEx<IProps, IComponentState> {
     let allArchives = true;
     const modNames = filteredIds
       .map(modId => {
-        let name = modName(this.mModsWithState[modId], {
+        let name = modName(this.state.modsWithState[modId], {
           version: true,
         });
-        if (this.mModsWithState[modId].state === 'downloaded') {
+        if (this.state.modsWithState[modId].state === 'downloaded') {
           name += ' ' + t('(Archive only)');
         } else {
           allArchives = false;
@@ -938,35 +944,47 @@ class ModList extends ComponentEx<IProps, IComponentState> {
     });
 
     const checkboxes = allArchives
-      ? [ { id: 'archive', text: t('Remove Archive'), value: true } ]
+      ? [ { id: 'archive', text: t('Delete Archive'), value: true } ]
       : [
         { id: 'mod', text: t('Remove Mod'), value: true },
-        { id: 'archive', text: t('Remove Archive'), value: false },
+        { id: 'archive', text: t('Delete Archive'), value: false },
       ];
 
-    onShowDialog('question', 'Confirm deletion', {
-      message: t('Do you really want to delete this mod?',
+    onShowDialog('question', 'Confirm removal', {
+      message: t('Do you really want to remove this mod?',
         { count: filteredIds.length, replace: { count: filteredIds.length } })
         + '\n' + modNames.join('\n'),
       checkboxes,
     }, [ { label: 'Cancel' }, { label: 'Remove' } ])
-    .then((result: IDialogResult) => {
+      .then((result: IDialogResult) => {
         removeMods = result.action === 'Remove' && result.input.mod;
         removeArchive = result.action === 'Remove' && result.input.archive;
 
         return (removeMods ? this.removeMods(filteredIds) : Promise.resolve())
           .then(() => filteredIds.forEach(key => {
-            if (removeMods) {
+            if (removeMods && this.state.modsWithState[key].state === 'installed') {
               onRemoveMod(gameMode, key);
             }
 
-            if (removeArchive && (this.mModsWithState[key] !== undefined)) {
-              const archiveId = this.mModsWithState[key].archiveId;
+            if (removeArchive && (this.state.modsWithState[key] !== undefined)) {
+              const archiveId = this.state.modsWithState[key].archiveId;
               if (removeArchive) {
                 this.context.api.events.emit('remove-download', archiveId);
               }
             }
           }));
+      })
+      .catch(ProcessCanceled, err => {
+        this.context.api.sendNotification({
+          id: 'cant-remove-mod',
+          type: 'warning',
+          title: 'Failed to remove mods',
+          message: err.message,
+        });
+      })
+      .catch(UserCanceled, () => null)
+      .catch(err => {
+        this.context.api.showErrorNotification('Failed to remove mod', err);
       });
   }
 

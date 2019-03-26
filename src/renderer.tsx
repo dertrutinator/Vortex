@@ -20,14 +20,16 @@ console.error = (...args) => {
 window.addEventListener('error', earlyErrHandler);
 window.addEventListener('unhandledrejection', earlyErrHandler);
 
-import * as sourceMapSupport from 'source-map-support';
-sourceMapSupport.install();
+import requireRemap from './util/requireRemap';
+requireRemap();
 
 if (process.env.NODE_ENV === 'development') {
   // tslint:disable-next-line:no-var-requires
   const rebuildRequire = require('./util/requireRebuild').default;
   rebuildRequire();
   process.traceProcessWarnings = true;
+  const sourceMapSupport = require('source-map-support');
+  sourceMapSupport.install();
 } else {
   // webpack will replace every occurrence of process.env.NODE_ENV in its endeavour to eliminate
   // dead code. It doesn't however set the environment variable itself for externals and the
@@ -47,7 +49,7 @@ process.env.SASS_BINARY_PATH = path.resolve(getVortexPath('modules'), 'node-sass
 
 import { addNotification } from './actions/notifications';
 import reducer, { Decision } from './reducers/index';
-import { terminate, toError, setOutdated } from './util/errorHandling';
+import { setOutdated, terminate, toError } from './util/errorHandling';
 import ExtensionManager from './util/ExtensionManager';
 import { ExtensionProvider } from './util/ExtensionProvider';
 import GlobalNotifications from './util/GlobalNotifications';
@@ -59,7 +61,8 @@ import { reduxSanity, StateError } from './util/reduxSanity';
 import MainWindow from './views/MainWindow';
 
 import * as Promise from 'bluebird';
-import { ipcRenderer, remote } from 'electron';
+import { ipcRenderer, remote, webFrame } from 'electron';
+import { forwardToMain, getInitialStateRenderer, replayActionRenderer } from 'electron-redux';
 import { EventEmitter } from 'events';
 import * as I18next from 'i18next';
 import { changeLanguage } from 'i18next';
@@ -68,16 +71,17 @@ import * as ReactDOM from 'react-dom';
 import { I18nextProvider } from 'react-i18next';
 import { Provider } from 'react-redux';
 import { applyMiddleware, compose, createStore } from 'redux';
-import { forwardToMain, getInitialStateRenderer, replayActionRenderer } from 'electron-redux';
 import thunkMiddleware from 'redux-thunk';
 
 import crashDump from 'crash-dump';
 
 // ensures tsc includes this dependency
+import { ThunkStore } from './types/IExtensionContext';
+import { UserCanceled } from './util/CustomErrors';
 import {} from './util/extensionRequire';
 import { reduxLogger } from './util/reduxLogger';
-import { ThunkStore } from './types/IExtensionContext';
-import { UserCanceled } from './util/api';
+import { getSafe } from './util/storeHelper';
+import { getAllPropertyNames } from './util/util';
 
 log('debug', 'renderer process started', { pid: process.pid });
 
@@ -124,8 +128,17 @@ function errorHandler(evt: any) {
     return;
   }
 
-  if (error === undefined) {
+  if ((error === undefined) || (getAllPropertyNames(error).length === 0)) {
     log('error', 'empty error object ignored', { wasPromise: evt.promise !== undefined });
+    return;
+  }
+
+  if (error.name === 'Invariant Violation') {
+    // these may not get caught, even when we have an ErrorBoundary, if the exception happens
+    // in some callback. Onfortunately this also makes these errors almost impossible to find,
+    // the code-stack is pointless (it's only react interna) and the component-stack gets
+    // stripped in production builds.
+    log('error', 'react invariant violation', { error: error.message, stack: error.stack });
     return;
   }
 
@@ -138,6 +151,8 @@ function errorHandler(evt: any) {
       && (
           (error.message === 'socket hang up')
           || (error.stack.indexOf('net::ERR_CONNECTION_RESET') !== -1)
+          || (error.stack.indexOf('net::ERR_ABORTED') !== -1)
+          || (error.stack.indexOf('PackeryItem.proto.positionDropPlaceholder') !== -1)
          )
       ) {
     log('warn', 'suppressing error message', { message: error.message, stack: error.stack });
@@ -265,6 +280,8 @@ store.subscribe(() => {
 function renderer() {
   let i18n: I18next.i18n;
   let error: Error;
+
+  webFrame.setZoomFactor(getSafe(store.getState(), ['settings', 'window', 'zoomFactor'], 1));
 
   getI18n(store.getState().settings.interface.language)
     .then(res => {

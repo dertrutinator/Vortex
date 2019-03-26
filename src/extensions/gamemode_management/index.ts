@@ -50,6 +50,7 @@ import * as Promise from 'bluebird';
 import { remote } from 'electron';
 import * as path from 'path';
 import * as Redux from 'redux';
+import * as semver from 'semver';
 
 const extensionGames: IGame[] = [];
 
@@ -250,7 +251,7 @@ function resetSearchPaths(api: IExtensionApi) {
 
   let list;
   try {
-    list = require('drivelist');
+    list = require('drivelist').list;
   } catch (err) {
     api.showErrorNotification('Failed to query list of system drives', 
       {
@@ -349,6 +350,9 @@ function init(context: IExtensionContext): boolean {
   //   is only added internally and not part of the public api
   context.registerGame = ((game: IGame, extensionPath: string) => {
     game.extensionPath = extensionPath;
+    const gameExtInfo = JSON.parse(fs.readFileSync(path.join(extensionPath, 'info.json'), { encoding: 'utf8' }));
+    game.contributed = gameExtInfo.author === 'Black Tree Gaming Ltd.' ? undefined : gameExtInfo.author;
+    game.final = semver.gte(gameExtInfo.version, '1.0.0');
     extensionGames.push(game);
   }) as any;
 
@@ -386,7 +390,7 @@ function init(context: IExtensionContext): boolean {
     }
   };
 
-  context.registerAction('game-icons', 100, 'refresh', {}, 'Quickscan', () => {
+  context.registerAction('game-icons', 100, 'refresh', {}, 'Scan: Quick', () => {
     if ($.gameModeManager !== undefined) {
       // we need the state from before the discovery so can determine which games were discovered
       const oldState: IState = context.api.store.getState();
@@ -406,6 +410,12 @@ function init(context: IExtensionContext): boolean {
             message,
           });
         });
+    }
+  });
+
+  context.registerAction('game-icons', 110, 'refresh', {}, 'Scan: Full', () => {
+    if (($.gameModeManager !== undefined) && !$.gameModeManager.isSearching()) {
+      $.gameModeManager.startSearchDiscovery();
     }
   });
 

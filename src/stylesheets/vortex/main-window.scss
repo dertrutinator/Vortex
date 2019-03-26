@@ -21,6 +21,11 @@
       width: 24px;
       height: 24px;
     }
+
+    .icon-launch-application {
+      stroke: $border-color;
+      stroke-width: 1px;
+    }
   }
 
   .main-toolbar-right {
@@ -234,9 +239,12 @@
 // footer
 #main-footer {
   background-color: $brand-bg;
-  * {
+  > * {
     overflow-x: hidden;
     text-overflow: ellipsis;
+  }
+  .progressbar-container {
+    max-width: 15em;
   }
 }
 

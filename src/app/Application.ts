@@ -6,7 +6,7 @@ import commandLine, {IParameters} from '../util/commandLine';
 import { ProcessCanceled, UserCanceled } from '../util/CustomErrors';
 import { } from '../util/delayed';
 import * as develT from '../util/devel';
-import { terminate, toError, setOutdated } from '../util/errorHandling';
+import { setOutdated, terminate, toError, setWindow } from '../util/errorHandling';
 import ExtensionManagerT from '../util/ExtensionManager';
 import * as fs from '../util/fs';
 import lazyRequire from '../util/lazyRequire';
@@ -19,7 +19,7 @@ import { allHives, createVortexStore, currentStatePath, extendStore,
          importState, insertPersistor, markImported, querySanitize } from '../util/store';
 import {} from '../util/storeHelper';
 import SubPersistor from '../util/SubPersistor';
-import { spawnSelf } from '../util/util';
+import { spawnSelf, truthy } from '../util/util';
 
 import { addNotification } from '../actions';
 
@@ -87,9 +87,12 @@ class Application {
 
   private startSplash(): Promise<SplashScreenT> {
     const SplashScreen = require('./SplashScreen').default;
-    const splash = new SplashScreen();
+    const splash: SplashScreenT = new SplashScreen();
     return splash.create()
-      .then(() => splash);
+      .then(() => {
+        setWindow(splash.getHandle());
+        return splash;
+      });
   }
 
   private setupAppEvents(args: IParameters) {
@@ -105,6 +108,12 @@ class Application {
         this.mMainWindow.create(this.mStore);
       }
     });
+
+    /* electron 3
+    app.on('second-instance', (event: Event, secondaryArgv: string[]) => {
+      this.applyArguments(commandLine(secondaryArgv));
+    });
+    */
 
     app.on('ready', () => {
       if (args.get) {
@@ -140,8 +149,13 @@ class Application {
         return;
       }
 
-      if (error === undefined) {
+      if (!truthy(error)) {
         log('error', 'empty error unhandled', { wasPromise: promise !== undefined });
+        return;
+      }
+
+      if (['net::ERR_CONNECTION_RESET', 'net::ERR_ABORTED'].indexOf(error.message) !== -1) {
+        log('warn', 'network error unhandled', error.stack);
         return;
       }
 
@@ -152,7 +166,7 @@ class Application {
   private regularStart(args: IParameters): Promise<void> {
     let splash: SplashScreenT;
 
-    return this.testShouldQuit(args.wait ? 10 : -1)
+    return this.testShouldQuit()
         .then(() => {
           setupLogging(app.getPath('userData'), process.env.NODE_ENV === 'development');
           log('info', '--------------------------');
@@ -200,18 +214,21 @@ class Application {
               details: err.message,
               stack: err.stack,
             }, this.mStore !== undefined ? this.mStore.getState() : {});
-          } catch (err) { }
+          } catch (err) {
+            // nop
+          }
         });
   }
 
   private warnAdmin(): Promise<void> {
     const state: IState = this.mStore.getState();
-    if (state.app.warnedAdmin > 0) {
-      return Promise.resolve();
-    }
     return isAdmin()
       .then(admin => {
         if (!admin) {
+          return Promise.resolve();
+        }
+        log('warn', 'running as administrator');
+        if (state.app.warnedAdmin > 0) {
           return Promise.resolve();
         }
         return new Promise((resolve, reject) => {
@@ -275,7 +292,7 @@ class Application {
           'Yes, I\'m mad',
         ],
         noLink: true,
-      }) == 0) {
+      }) === 0) {
         app.quit();
         return Promise.reject(new UserCanceled());
       }
@@ -285,7 +302,8 @@ class Application {
         .then(() => {
           return Promise.resolve();
         })
-        .catch(err => !(err instanceof UserCanceled) && !(err instanceof ProcessCanceled), (err: Error) => {
+        .catch(err => !(err instanceof UserCanceled)
+                   && !(err instanceof ProcessCanceled), (err: Error) => {
           dialog.showErrorBox(
             'Migration failed',
             'The migration from the previous Vortex release failed. '
@@ -293,13 +311,12 @@ class Application {
           app.exit(1);
           return Promise.reject(new ProcessCanceled('Migration failed'));
         });
-    } else {
-      return Promise.resolve();
     }
+    return Promise.resolve();
   }
 
   private splitPath(statePath: string): string[] {
-    return statePath.match(/(\\.|[^.])+/g).map(input => input.replace(/\\(.)/, '$1'));
+    return statePath.match(/(\\.|[^.])+/g).map(input => input.replace(/\\(.)/g, '$1'));
   }
 
   private handleGet(getPath: string | boolean, shared: boolean): Promise<void> {
@@ -455,7 +472,8 @@ class Application {
 
     const updateBackups = () => fs.ensureDirAsync(backupPath)
       .then(() => fs.readdirAsync(backupPath))
-      .filter((fileName: string) => fileName.startsWith('backup') && path.extname(fileName) === '.json')
+      .filter((fileName: string) =>
+        fileName.startsWith('backup') && path.extname(fileName) === '.json')
       .then(backupsIn => { backups = backupsIn; });
 
     const deleteBackups = () => Promise.map(backups, backupName =>
@@ -493,6 +511,8 @@ class Application {
         log('info', `using ${dataPath} as the storage directory`);
         if (multiUser) {
           setLogPath(dataPath);
+          log('info', '--------------------------');
+          log('info', 'Vortex Version', app.getVersion());
           return LevelPersist.create(path.join(dataPath, currentStatePath))
             .then(levelPersistor => {
               this.mLevelPersistors.push(levelPersistor);
@@ -549,7 +569,9 @@ class Application {
               }
               terminate({
                 message: 'Failed to restore backup',
-                details: err.code !== 'ENOENT' ? err : 'Specified backup file doesn\'t exist',
+                details: err.code !== 'ENOENT' ? err.message : 'Specified backup file doesn\'t exist',
+                stack: err.stack,
+                path: restoreBackup,
               }, {}, err.code !== 'ENOENT');
             });
         } else {
@@ -568,7 +590,7 @@ class Application {
             message: 'A backup of application state was created recently.',
             actions: [
               { title: 'Restore', action: () => {
-                const sorted = backups.sort((lhs, rhs) => rhs.localeCompare(lhs))
+                const sorted = backups.sort((lhs, rhs) => rhs.localeCompare(lhs));
                 log('info', 'sorted backups', sorted);
                 spawnSelf(['--restore', path.join(backupPath, sorted[0])]);
                 app.exit();
@@ -577,8 +599,8 @@ class Application {
                 deleteBackups();
                 dismiss();
               } },
-            ]
-          }))
+            ],
+          }));
         }
       })
       .then(() => this.mExtensions.doOnce());
@@ -600,35 +622,40 @@ class Application {
 
   private showMainWindow() {
     if (this.mMainWindow === null) {
-      // ??? renderer has signaled it's done loading before we even started it? that can't be right...
+      // ??? renderer has signaled it's done loading before we even started it?
+      // that can't be right...
       app.exit();
       return;
     }
     const windowMetrics = this.mStore.getState().settings.window;
     const maximized: boolean = windowMetrics.maximized || false;
     this.mMainWindow.show(maximized);
+    setWindow(this.mMainWindow.getHandle());
   }
 
-  private testShouldQuit(retries: number): Promise<void> {
-    // different modes: if retries were set, the caller wants to start a
-    // "primary" instance and is willing to wait. In that case we don't act as
-    // a secondary instance that sends off it's arguments to the first
-    const remoteCallback = (retries === -1) ?
-                               (secondaryArgv, workingDirectory) => {
-                                 // this is called inside the primary process
-                                 // with the parameters of
-                                 // the secondary one whenever an additional
-                                 // instance is started
-                                 this.applyArguments(commandLine(secondaryArgv));
-                               } :
-                               () => undefined;
+  private testShouldQuit(): Promise<void> {
+    /* electron 3
+    const primaryInstance: boolean = app.requestSingleInstanceLock();
+
+    if (primaryInstance) {
+      return Promise.resolve();
+    } else {
+      app.exit();
+      return Promise.reject(new ProcessCanceled('should quit'));
+    }
+    */
+
+    const remoteCallback = (secondaryArgv, workingDirectory) => {
+      // this is called inside the primary process
+      // with the parameters of
+      // the secondary one whenever an additional
+      // instance is started
+      this.applyArguments(commandLine(secondaryArgv));
+    };
 
     const shouldQuit: boolean = app.makeSingleInstance(remoteCallback);
 
     if (shouldQuit) {
-      if (retries > 0) {
-        return Promise.delay(100).then(() => this.testShouldQuit(retries - 1));
-      }
       // exit instead of quit so events don't get triggered. Otherwise an exception may be caused
       // by failures to require modules
       app.exit();

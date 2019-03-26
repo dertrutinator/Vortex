@@ -18,7 +18,8 @@ export class DatabaseLocked extends Error {
 
 function openDB(dbPath: string): Promise<levelup.LevelUp> {
   return new Promise<levelup.LevelUp>((resolve, reject) => {
-    (levelup as any)(encode(leveldown(dbPath)), { keyEncoding: 'utf8', valueEncoding: 'utf8' }, (err, db) => {
+    (levelup as any)(encode(leveldown(dbPath)),
+                     { keyEncoding: 'utf8', valueEncoding: 'utf8' }, (err, db) => {
       if (err !== null) {
         return reject(err);
       }
@@ -47,7 +48,7 @@ class LevelPersist implements IPersistor {
     this.mDB = db;
   }
 
-  public setResetCallback(cb: () => void): void {
+  public setResetCallback(cb: () => Promise<void>): void {
     return undefined;
   }
 

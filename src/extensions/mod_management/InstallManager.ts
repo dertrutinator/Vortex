@@ -1,27 +1,29 @@
 import { showDialog } from '../../actions/notifications';
 import { IDialogResult } from '../../types/IDialog';
 import { IExtensionApi, ThunkStore } from '../../types/IExtensionContext';
-import {IState} from '../../types/IState';
-import { DataInvalid, ProcessCanceled, TemporaryError,
-         UserCanceled } from '../../util/CustomErrors';
-import { createErrorReport, isOutdated } from '../../util/errorHandling';
+import {IState, IProfile} from '../../types/IState';
+import { DataInvalid, ProcessCanceled, SetupError, TemporaryError,
+         UserCanceled} from '../../util/CustomErrors';
+import { createErrorReport, isOutdated, withContext, didIgnoreError } from '../../util/errorHandling';
 import * as fs from '../../util/fs';
 import getNormalizeFunc, { Normalize } from '../../util/getNormalizeFunc';
 import { log } from '../../util/log';
-import { activeProfile, downloadPath } from '../../util/selectors';
+import { prettifyNodeErrorMessage } from '../../util/message';
+import { activeProfile, downloadPathForGame } from '../../util/selectors';
 import { getSafe } from '../../util/storeHelper';
-import { setdefault } from '../../util/util';
+import { setdefault, truthy } from '../../util/util';
 import walk from '../../util/walk';
 
 import { IDownload } from '../download_management/types/IDownload';
 import getDownloadGames from '../download_management/util/getDownloadGames';
-import { getGame } from '../gamemode_management/util/getGame';
 import { IModType } from '../gamemode_management/types/IModType';
+import { getGame } from '../gamemode_management/util/getGame';
 import modName from '../mod_management/util/modName';
 import { setModEnabled } from '../profile_management/actions/profiles';
 
-import {setModAttribute, setModType} from './actions/mods';
+import {setModAttribute, setModType, addModRule, setFileOverride} from './actions/mods';
 import {IDependency} from './types/IDependency';
+import { IInstallContext } from './types/IInstallContext';
 import { IInstallResult, IInstruction } from './types/IInstallResult';
 import {IMod} from './types/IMod';
 import { IModInstaller } from './types/IModInstaller';
@@ -41,28 +43,14 @@ import Zip = require('node-7z');
 import * as os from 'os';
 import * as path from 'path';
 import * as Redux from 'redux';
-import * as rimraf from 'rimraf';
-import { IInstallContext } from './types/IInstallContext';
-import renderModName from '../mod_management/util/modName';
 
 export class ArchiveBrokenError extends Error {
-  constructor() {
-    super('Archive is broken');
+  constructor(message: string) {
+    super(`Archive is broken: ${message}`);
 
     this.name = this.constructor.name;
   }
 }
-
-// TODO: the type declaration for rimraf is actually wrong atm (v0.0.28)
-interface IRimrafOptions {
-  glob?: { nosort: boolean, silent: boolean } | false;
-  disableGlob?: boolean;
-  emfileWait?: number;
-  maxBusyTries?: number;
-}
-type rimrafType = (path: string, options: IRimrafOptions, callback: (err?) => void) => void;
-const rimrafAsync: (path: string, options: IRimrafOptions) => Promise<void> =
-  Promise.promisify(rimraf as rimrafType) as any;
 
 interface IReplaceChoice {
   id: string;
@@ -86,6 +74,7 @@ class InstructionGroups {
   public attribute: IInstruction[] = [];
   public setmodtype: IInstruction[] = [];
   public error: IInstruction[] = [];
+  public rule: IInstruction[] = [];
 }
 
 export const INI_TWEAKS_PATH = 'Ini Tweaks';
@@ -141,7 +130,8 @@ class InstallManager {
    *                                      of others and tries to install those too
    * @param {boolean} enable if true, enable the mod after installation
    * @param {Function} callback callback once this is finished
-   * @param {boolean} forceGameId set if the user has already been queried which game to install the mod for
+   * @param {boolean} forceGameId set if the user has already been queried which game
+   *                              to install the mod for
    */
   public install(
     archiveId: string,
@@ -159,6 +149,8 @@ class InstallManager {
     }
 
     const fullInfo = { ...info };
+    let rules: IRule[] = [];
+    let overrides: string[] = [];
     let destinationPath: string;
     let tempPath: string;
 
@@ -171,7 +163,7 @@ class InstallManager {
     let installContext: InstallContext;
 
     this.mQueue = this.mQueue
-      .then(() => forceGameId !== undefined
+      .then(() => withContext('Installing', baseName, () => ((forceGameId !== undefined)
         ? Promise.resolve(forceGameId)
         : queryGameId(api.store, downloadGameIds))
       .then(gameId => {
@@ -185,6 +177,7 @@ class InstallManager {
         return api.lookupModMeta({ filePath: archivePath, gameId });
       })
       .then((modInfo: ILookupResult[]) => {
+        log('debug', 'got mod meta information', { archivePath, resultCount: modInfo.length });
         if (modInfo.length > 0) {
           fullInfo.meta = modInfo[0].value;
         }
@@ -212,6 +205,7 @@ class InstallManager {
       //   even a particularly good way to discover conflicts
       .then(newModId => {
         modId = newModId;
+        log('debug', 'mod id for newly installed mod', { archivePath, modId });
         return filterModInfo(fullInfo, undefined);
       })
       .then(modInfo => {
@@ -231,6 +225,8 @@ class InstallManager {
                 }
                 return Promise.resolve();
               } else if (action === 'Replace') {
+                rules = oldMod.rules;
+                overrides = oldMod.fileOverrides;
                 // we need to remove the old mod before continuing. This ensures
                 // the mod is deactivated and undeployed (so we're not leave dangling
                 // links) and it ensures we do a clean install of the mod
@@ -258,6 +254,7 @@ class InstallManager {
         installContext.startInstallCB(modId, installGameId, archiveId);
 
         destinationPath = path.join(this.mGetInstallPath(installGameId), modId);
+        log('debug', 'installing to', { modId, destinationPath });
         installContext.setInstallPathCB(modId, destinationPath);
         tempPath = destinationPath + '.installing';
         return this.installInner(api, archivePath,
@@ -279,19 +276,26 @@ class InstallManager {
       .then(result => this.processInstructions(api, archivePath, tempPath, destinationPath,
                                                installGameId, modId, result))
       .finally(() => (tempPath !== undefined)
-        ? rimrafAsync(tempPath, { glob: false })
-        : Promise.resolve())
+        ? fs.removeAsync(tempPath) : Promise.resolve())
       .then(() => filterModInfo(fullInfo, destinationPath))
       .then(modInfo => {
         installContext.finishInstallCB('success', modInfo);
+        rules.forEach(rule => {
+          api.store.dispatch(addModRule(installGameId, modId, rule));
+        });
+        api.store.dispatch(setFileOverride(installGameId, modId, overrides));
         if (enable) {
           api.store.dispatch(setModEnabled(currentProfile.id, modId, true));
           api.events.emit('mods-enabled', [modId], true, currentProfile.gameId);
         }
         if (processDependencies) {
           log('info', 'process dependencies', { modId });
-          this.installDependencies(modInfo.rules, this.mGetInstallPath(installGameId),
-            installContext, api);
+          const state: IState = api.store.getState();
+          const mod: IMod = getSafe(state, ['persistent', 'mods', installGameId, modId], undefined);
+
+          this.installDependencies([].concat(modInfo.rules || [], mod.rules || []),
+                                   this.mGetInstallPath(installGameId),
+                                   currentProfile, installContext, api);
         }
         if (callback !== undefined) {
           callback(null, modId);
@@ -309,18 +313,22 @@ class InstallManager {
                          || ((err.stack !== undefined)
                              && err.stack.startsWith('UserCanceled: canceled by user'));
         let prom = destinationPath !== undefined
-          ? rimrafAsync(destinationPath, { glob: false, maxBusyTries: 10 })
-            .catch(err => {
+          ? fs.removeAsync(destinationPath)
+            .catch(innerErr => {
               installContext.reportError(
-                'Failed to clean up installation directory "{{destinationPath}}", please close Vortex and remove it manually',
-                err, true, { destinationPath })
+                'Failed to clean up installation directory "{{destinationPath}}", '
+                + 'please close Vortex and remove it manually.',
+                innerErr, true, { destinationPath });
             })
           : Promise.resolve();
 
         if (installContext !== undefined) {
+          const pretty = prettifyNodeErrorMessage(err);
           // context doesn't have to be set if we canceled early
           prom = prom.then(() => installContext.finishInstallCB(
-            canceled ? 'canceled' : 'failed', undefined, err.message));
+            canceled ? 'canceled' : 'failed',
+            undefined,
+            api.translate(pretty.message, { replace: pretty.replace })));
         }
 
         if (err === undefined) {
@@ -346,35 +354,51 @@ class InstallManager {
                   { installerPath: path.basename(archivePath) });
               }
             });
+        } else if (err instanceof SetupError) {
+          return prom
+            .then(() => {
+              if (installContext !== undefined) {
+                installContext.reportError(
+                  'Installation failed',
+                  err,
+                  false, {
+                    installerPath: path.basename(archivePath),
+                    message: err.message,
+                  });
+              }
+            });
         } else if (err instanceof DataInvalid) {
           return prom
             .then(() => {
               if (installContext !== undefined) {
                 installContext.reportError(
                   'Installation failed',
-                  `The installer {{ installerPath }} is invalid and couldn't be `
+                  'The installer {{ installerPath }} is invalid and couldn\'t be '
                   + 'installed:\n{{ message }}\nPlease inform the mod author.\n',
                   false, {
                     installerPath: path.basename(archivePath),
-                    message: err.message });
+                    message: err.message,
+                  });
               }
             });
         } else {
           const { genHash } = require('modmeta-db');
-          const errMessage = typeof err === 'string' ? err : err.message + '\n' + err.stack;
 
           return prom
             .then(() => genHash(archivePath).catch(() => ({})))
             .then((hashResult: IHashResult) => {
               const id = `${path.basename(archivePath)} (md5: ${hashResult.md5sum})`;
-              if (installContext !== undefined) {
-                installContext.reportError(
-                    'Installation failed',
-                    `The installer "{{ id }}" failed: {{ message }}`,
-                    ['EPERM', 'ENOENT', 'ENOSPC'].indexOf(err.code) === -1, {
+              let message = err;
+              let replace = {};
+              if (typeof err === 'string') {
+                message = 'The installer "{{ id }}" failed: {{ message }}';
+                replace = {
                       id,
-                      message: errMessage,
-                    });
+                      message: err,
+                    };
+              }
+              if (installContext !== undefined) {
+                installContext.reportError('Installation failed', message, undefined, replace);
               }
               if (callback !== undefined) {
                 callback(err, modId);
@@ -386,7 +410,7 @@ class InstallManager {
         if (installContext !== undefined) {
           installContext.stopIndicator();
         }
-      });
+      })));
   }
 
   private isCritical(error: string): boolean {
@@ -406,21 +430,24 @@ class InstallManager {
         installContext.setProgress(percent);
       }
     };
-    process.noAsar = true;
+    // process.noAsar = true;
+    log('debug', 'extracting mod archive', { archivePath, tempPath });
     return this.mTask.extractFull(archivePath, tempPath, {ssc: false},
                                   progress,
                                   () => this.queryPassword(api.store))
         .catch((err: Error) => this.isCritical(err.message)
-          ? Promise.reject(new ArchiveBrokenError())
+          ? Promise.reject(new ArchiveBrokenError(err.message))
           : Promise.reject(err))
         .then(({ code, errors }: {code: number, errors: string[] }) => {
+          log('debug', 'extraction completed', { code, errors });
           if (installContext !== undefined) {
             installContext.setProgress();
           }
           if (code !== 0) {
+            log('warn', 'extraction reported error', { code, errors });
             const critical = errors.find(this.isCritical);
             if (critical !== undefined) {
-              return Promise.reject(new ArchiveBrokenError());
+              return Promise.reject(new ArchiveBrokenError(critical));
             }
             return this.queryContinue(api, errors);
           } else {
@@ -440,7 +467,7 @@ class InstallManager {
                            return Promise.resolve();
                          }))
         .finally(() => {
-          process.noAsar = false;
+          // process.noAsar = false;
         })
         .then(() => this.getInstaller(fileList, gameId))
         .then(supportedInstaller => {
@@ -449,6 +476,8 @@ class InstallManager {
           }
 
           const {installer, requiredFiles} = supportedInstaller;
+          // TODO: We don't have an id for installers - that would be useful here...
+          log('debug', 'invoking installer', supportedInstaller.installer.priority);
           return installer.install(
               fileList, tempPath, gameId,
               (perc: number) => log('info', 'progress', perc));
@@ -457,10 +486,15 @@ class InstallManager {
 
   private determineModType(gameId: string, installInstructions: IInstruction[]): Promise<string> {
     log('info', 'determine mod type', { gameId });
-    const modTypes: IModType[] = getGame(gameId).modTypes;
+    const game = getGame(gameId);
+    if (game === undefined) {
+      return Promise.reject(new Error(`Invalid game "${gameId}"`));
+    }
+    const modTypes: IModType[] = game.modTypes;
     // sort with priority descending so we can stop as soon as we've hit the first match
     const sorted = modTypes.sort((lhs, rhs) => rhs.priority - lhs.priority);
     let found = false;
+
     return Promise.mapSeries(sorted, (type: IModType): Promise<string> => {
       if (found) {
         return Promise.resolve<string>(null);
@@ -521,7 +555,7 @@ class InstallManager {
 
   private transformInstructions(input: IInstruction[]): InstructionGroups {
     return input.reduce((prev, value) => {
-      if (prev[value.type] !== undefined) {
+      if (truthy(value) && (prev[value.type] !== undefined)) {
         prev[value.type].push(value);
       }
       return prev;
@@ -546,7 +580,7 @@ class InstallManager {
                           `Missing instructions: ${missing.join(', ')}\n` +
                               `Installer name: ${path.basename(archivePath)}\n` +
                               `MD5 checksum: ${hashResult.md5sum}\n`,
-                    },
+                    }, {},
                     ['installer'], api.store.getState()));
     const showUnsupportedDialog = () => api.store.dispatch(showDialog(
         'info', 'Installer unsupported',
@@ -555,7 +589,7 @@ class InstallManager {
               'This installer is (partially) unsupported as it\'s ' +
               'using functionality that hasn\'t been implemented yet. ' +
               'Please help us fix this by submitting an error report with a link to this mod.',
-        }, isOutdated() ? [
+        }, (isOutdated() || didIgnoreError()) ? [
           { label: 'Close' },
         ] : [
           { label: 'Report', action: makeReport },
@@ -603,7 +637,7 @@ class InstallManager {
               api.store.dispatch(setModType(gameId, modId, mod.submoduleType));
             }
           })
-          .finally(() => rimrafAsync(tempPath, { glob: false, maxBusyTries: 1 }));
+          .finally(() => fs.removeAsync(tempPath));
       })
         .then(() => undefined);
   }
@@ -624,6 +658,14 @@ class InstallManager {
         log('error', 'got more than one mod type, only the last was used', { types });
       }
     }
+    return Promise.resolve();
+  }
+
+  private processRule(api: IExtensionApi, rules: IInstruction[],
+                      gameId: string, modId: string): Promise<void> {
+    rules.forEach(rule => {
+      api.store.dispatch(addModRule(gameId, modId, rule.rule));
+    })
     return Promise.resolve();
   }
 
@@ -679,17 +721,18 @@ class InstallManager {
 
     if (instructionGroups.error.length > 0) {
       api.showErrorNotification('Installer reported errors',
-        'Errors were reported processing this installer. It\'s possible the mod works (partially) anyway. '
-        + 'Please not that NMM tends to ignore errors so just because NMM doesn\'t '
+        'Errors were reported processing the installer for "{{ modId }}". '
+        + 'It\'s possible the mod works (partially) anyway. '
+        + 'Please note that NMM tends to ignore errors so just because NMM doesn\'t '
         + 'report a problem with this installer doesn\'t mean it doesn\'t have any.\n'
         + '{{ errors }}'
         , {
           replace: {
             errors: instructionGroups.error.map(err => err.source).join('\n'),
+            modId,
           },
           allowReport: false,
-        }
-      );
+        });
     }
 
     log('debug', 'installer instructions', instructionGroups);
@@ -705,6 +748,7 @@ class InstallManager {
                                         destinationPath, gameId, modId))
       .then(() => this.processAttribute(api, instructionGroups.attribute, gameId, modId))
       .then(() => this.processSetModType(api, instructionGroups.setmodtype, gameId, modId))
+      .then(() => this.processRule(api, instructionGroups.rule, gameId, modId))
       ;
     }
 
@@ -732,7 +776,7 @@ class InstallManager {
       store.dispatch(showDialog(
           'question', modName(oldMod),
           {
-            message:
+            text:
             'An older version of this mod is already installed.' +
             'You can replace the existing one or install this one alongside it. ' +
             'If you have other profiles they will continue using the old version.',
@@ -759,7 +803,7 @@ class InstallManager {
       const mod: IMod = state.persistent.mods[gameId][modId];
       api.store
         .dispatch(showDialog(
-          'question', renderModName(mod, { version: false }),
+          'question', modName(mod, { version: false }),
           {
             text:
               'This mod seems to be installed already. You can replace the ' +
@@ -864,28 +908,33 @@ class InstallManager {
     });
   }
 
-  private doInstallDependencies(
-    dependencies: IDependency[],
-    api: IExtensionApi): Promise<void> {
+  private doInstallDependencies(dependencies: IDependency[],
+                                profile: IProfile,
+                                api: IExtensionApi): Promise<void> {
     return Promise.all(dependencies.map((dep: IDependency) => {
+      let dlPromise = Promise.resolve(dep.download);
       if (dep.download === undefined) {
-        return this.downloadModAsync(
-          dep.reference,
-          dep.lookupResults[0].value.sourceURI,
-          api)
-          .then((downloadId: string) => {
-            return this.installModAsync(dep.reference, api,
-              downloadId);
-          })
-          .catch(ProcessCanceled, () => undefined)
-          .catch(UserCanceled, () => undefined)
-          .catch(err => {
-            api.showErrorNotification('Failed to install dependency', err);
-          });
-      } else {
-        return this.installModAsync(dep.reference, api,
-          dep.download);
+        if (getSafe(dep, ['lookupResults', 0, 'value', 'sourceURI'], '') === '') {
+          dlPromise = Promise.reject(new ProcessCanceled('Failed to determine download url'));
+        } else {
+          dlPromise = this.downloadModAsync(
+            dep.reference,
+            dep.lookupResults[0].value.sourceURI,
+            api);
+        }
       }
+      return dlPromise
+        .then((downloadId: string) => this.installModAsync(dep.reference, api, downloadId))
+        .then((modId: string) => api.store.dispatch(setModEnabled(profile.id, modId, true)))
+        // don't cancel the whole process if one dependency fails to install
+        .catch(ProcessCanceled, err => {
+          api.showErrorNotification('Failed to install dependency', err.message,
+                                    { allowReport: false });
+        })
+        .catch(UserCanceled, () => undefined)
+        .catch(err => {
+          api.showErrorNotification('Failed to install dependency', err);
+        });
     }))
       .catch(ProcessCanceled, err => {
         // This indicates an error in the dependency rules so it's
@@ -903,6 +952,7 @@ class InstallManager {
   private installDependencies(
     rules: IRule[],
     installPath: string,
+    profile: IProfile,
     installContext: InstallContext,
     api: IExtensionApi): Promise<void> {
     const notificationId = `${installPath}_activity`;
@@ -934,7 +984,7 @@ installed, ${requiredDownloads} of them have to be downloaded first.`;
                 {label: 'Don\'t install'},
                 {
                   label: 'Install',
-                  action: () => this.doInstallDependencies(dependencies, api),
+                  action: () => this.doInstallDependencies(dependencies, profile, api),
                 },
               ]));
         });
@@ -945,14 +995,14 @@ installed, ${requiredDownloads} of them have to be downloaded first.`;
       });
   }
 
-  private installModAsync(
-    requirement: IReference,
-    api: IExtensionApi,
-    downloadId: string): Promise<string> {
+  private installModAsync(requirement: IReference,
+                          api: IExtensionApi,
+                          downloadId: string): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       const state = api.store.getState();
       const download: IDownload = state.persistent.downloads.files[downloadId];
-      const fullPath: string = path.join(downloadPath(state), download.localPath);
+      const downloadGame: string = Array.isArray(download.game) ? download.game[0] : download.game;
+      const fullPath: string = path.join(downloadPathForGame(state, downloadGame), download.localPath);
       this.install(downloadId, fullPath, getDownloadGames(download),
         api, { download }, false, false, (error, id) => {
           if (error === null) {
@@ -965,14 +1015,10 @@ installed, ${requiredDownloads} of them have to be downloaded first.`;
   }
 
   private transferFile(source: string, destination: string, move: boolean): Promise<void> {
-    const command = move ? fs.renameAsync : fs.copyAsync;
     return fs.ensureDirAsync(path.dirname(destination))
-      .then(() => command(source, destination))
-      .catch(err => {
-        return err.code === 'EPERM'
-        ? Promise.delay(100).then(() => command(source, destination))
-        : Promise.reject(err);
-      });
+      .then(() => move
+        ? fs.renameAsync(source, destination)
+        : fs.copyAsync(source, destination, { noSelfCopy: true }));
   }
 
   /**
@@ -1013,6 +1059,8 @@ installed, ${requiredDownloads} of them have to be downloaded first.`;
                 .catch(err => {
                   if (err.code === 'ENOENT') {
                     missingFiles.push(srcRel);
+                  } else if (err.code === 'EPERM') {
+                    return this.transferFile(sourcePath, destPath, false);
                   } else {
                     return Promise.reject(err);
                   }

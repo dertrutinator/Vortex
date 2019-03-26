@@ -1,10 +1,13 @@
-import { ProcessCanceled } from '../../util/CustomErrors';
+import { ProcessCanceled, UserCanceled } from '../../util/CustomErrors';
 import * as fs from '../../util/fs';
 import { log } from '../../util/log';
 
 import * as Promise from 'bluebird';
+import { dialog as dialogIn, remote } from 'electron';
 import * as fsFast from 'fs-extra-promise';
 import * as path from 'path';
+
+const dialog = remote !== undefined ? remote.dialog : dialogIn;
 
 /**
  * assembles a file received in chunks.
@@ -18,6 +21,7 @@ class FileAssembler {
   private static MIN_FLUSH_TIME = 5 * 1000;
 
   private mFD: number;
+  private mFileName: string;
   private mTotalSize: number;
   private mWork: Promise<any> = Promise.resolve();
   private mWritten: number = 0;
@@ -40,12 +44,34 @@ class FileAssembler {
       this.mTotalSize = 0;
     }
     fs.ensureDirSync(path.dirname(fileName));
+    this.mFileName = fileName;
     this.mFD = fs.openSync(fileName, exists ? 'r+' : 'w');
   }
 
   public setTotalSize(size: number) {
     this.mWork = this.mWork.then(() => {
       this.mTotalSize = size;
+    });
+  }
+
+  public isClosed() {
+    return this.mFD === undefined;
+  }
+
+  public rename(newName: string | Promise<string>) {
+    let resolved: string;
+    this.mWork = this.mWork.then(() => Promise.resolve(newName))
+    .then(nameResolved => {
+      resolved = nameResolved;
+      fs.closeAsync(this.mFD);
+    })
+    .then(() => fs.renameAsync(this.mFileName, resolved))
+    .then(() => {
+      this.mFileName = resolved;
+      return fs.openAsync(resolved, 'r+');
+    })
+    .then(fd => {
+      this.mFD = fd;
     });
   }
 
@@ -73,28 +99,38 @@ class FileAssembler {
             return Promise.resolve(bytesWritten);
           }
         })
-        .then((bytesWritten: number) =>
-          (bytesWritten !== data.length)
+        .then((bytesWritten: number) => (bytesWritten !== data.length)
             ? reject(new Error(`incomplete write ${bytesWritten}/${data.length}`))
             : resolve(synced))
-        .catch(ProcessCanceled, () => {
-          resolve(false);
+        .catch({ code: 'ENOSPC' }, () => {
+          let win = remote !== undefined ? remote.getCurrentWindow() : null;
+          (dialog.showMessageBox(win, {
+            type: 'warning',
+            title: 'Disk is full',
+            message: 'Download can\'t continue because disk is full, please free some some space and retry.',
+            buttons: ['Cancel', 'Retry'],
+            defaultId: 1,
+            noLink: true,
+          }) === 1)
+            ? resolve(this.addChunk(offset, data))
+            : reject(new UserCanceled())
         })
         .catch(err => reject(err));
       });
   }
 
   public close(): Promise<void> {
-    return this.mWork
+    this.mWork =  this.mWork
     .then(() => {
       if (this.mFD !== undefined) {
         const fd = this.mFD;
         this.mFD = undefined;
-        return fs.closeAsync(fd);
+        return fs.fsyncAsync(fd).then(() => fs.closeAsync(fd));
       } else {
         return Promise.resolve();
       }
     });
+    return this.mWork;
   }
 }
 

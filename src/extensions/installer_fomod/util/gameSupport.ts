@@ -19,6 +19,8 @@ const gamebryoPatterns: string[] = [
   '[^/]*\\.esp$',
   '[^/]*\\.esm$',
   '[^/]*\\.esl$',
+  '[^/]*\\.bsa$',
+  '[^/]*\\.ba2$',
   'fomod/ModuleConfig.xml$',
 ].concat(gamebryoTopLevel.map(toWordExp));
 
@@ -155,6 +157,15 @@ const gameSupport: { [gameId: string]: IGameSupport } = {
   },
   skyrim: {
     iniPath: () => bethIni('Skyrim', 'Skyrim'),
+    stopPatterns: stopPatterns('skyrim'),
+    pluginPath: 'Data',
+    nativePlugins: [
+      'skyrim.esm',
+      'update.esm',
+    ],
+  },
+  enderal: {
+    iniPath: () => bethIni('Enderal', 'Enderal'),
     stopPatterns: stopPatterns('skyrim'),
     pluginPath: 'Data',
     nativePlugins: [

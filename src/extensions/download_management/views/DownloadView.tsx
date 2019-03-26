@@ -13,6 +13,7 @@ import { ComponentEx, connect, translate } from '../../../util/ComponentEx';
 import { ProcessCanceled, UserCanceled } from '../../../util/CustomErrors';
 import { showError } from '../../../util/message';
 import * as selectors from '../../../util/selectors';
+import { truthy } from '../../../util/util';
 import MainPage from '../../../views/MainPage';
 
 import { IGameStored } from '../../gamemode_management/types/IGameStored';
@@ -59,7 +60,8 @@ interface IActionProps {
   onShowGraph: (show: boolean) => void;
 }
 
-export type IDownloadViewProps = IDownloadViewBaseProps & IConnectedProps & IActionProps & { t: I18next.TranslationFunction };
+export type IDownloadViewProps =
+  IDownloadViewBaseProps & IConnectedProps & IActionProps & { t: I18next.TranslationFunction };
 
 interface IComponentState {
   viewAll: boolean;
@@ -70,7 +72,7 @@ const nop = () => null;
 class DownloadView extends ComponentEx<IDownloadViewProps, IComponentState> {
   public context: IComponentContext;
   private actions: ITableRowAction[];
-  private mColumns: ITableAttribute<IDownload>[] = [];
+  private mColumns: Array<ITableAttribute<IDownload>> = [];
 
   constructor(props: IDownloadViewProps) {
     super(props);
@@ -112,8 +114,8 @@ class DownloadView extends ComponentEx<IDownloadViewProps, IComponentState> {
         condition: this.resumable,
       },
       {
-        icon: 'remove',
-        title: 'Remove',
+        icon: 'delete',
+        title: 'Delete',
         action: this.remove,
         condition: this.removable,
         hotKey: { code: 46 },
@@ -291,22 +293,27 @@ class DownloadView extends ComponentEx<IDownloadViewProps, IComponentState> {
     downloadIds.forEach((downloadId: string) => {
       this.context.api.events.emit('resume-download', downloadId, (err) => {
         if (err !== null) {
+          const urlInvalid = ['moved permanently', 'forbidden', 'gone'];
           if (err instanceof ProcessCanceled) {
             this.props.onShowError('Failed to download',
                                    'Sorry, this download is missing info necessary to resume. '
                                    + 'Please try restarting it.',
                                    undefined, false);
-          } else if (['moved permanently', 'forbidden', 'gone'].indexOf(err.HTTPStatus.toLowerCase()) !== -1) {
-            this.props.onShowError('Failed to resume download', 'Sorry, the download link is no longer valid. '
-                                 + 'Please restart the download.',
+          } else if ((err.HTTPStatus !== undefined)
+                     && (urlInvalid.indexOf(err.HTTPStatus.toLowerCase()) !== -1)) {
+            this.props.onShowError('Failed to resume download',
+                                   'Sorry, the download link is no longer valid. '
+                                   + 'Please restart the download.',
               undefined, false);
           } else if (err.code === 'ECONNRESET') {
-            this.props.onShowError('Failed to resume download', 'Server closed the connection, please '
-                                  + 'check your internet connection',
+            this.props.onShowError('Failed to resume download',
+                                   'Server closed the connection, please '
+                                   + 'check your internet connection',
               undefined, false);
           } else if (err.code === 'ETIMEDOUT') {
-            this.props.onShowError('Failed to resume download', 'Connection timed out, please check '
-                                  + 'your internet connection',
+            this.props.onShowError('Failed to resume download',
+                                   'Connection timed out, please check '
+                                   + 'your internet connection',
               undefined, false);
           } else if (err.code === 'ENOSPC') {
             this.props.onShowError('Failed to resume download', 'The disk is full',
@@ -330,24 +337,20 @@ class DownloadView extends ComponentEx<IDownloadViewProps, IComponentState> {
       this.context.api.events.emit('remove-download', id);
     };
 
-    if (downloadIds.length === 1) {
-      removeId(downloadIds[0]);
-    } else {
-      const { t, onShowDialog } = this.props;
+    const { t, onShowDialog } = this.props;
 
-      const downloadNames = downloadIds.map((downloadId: string) => (
-        this.getDownload(downloadId).localPath
-      ));
+    const downloadNames = downloadIds.map((downloadId: string) => (
+      this.getDownload(downloadId).localPath
+    ));
 
-      onShowDialog('question', 'Confirm Removal', {
-        message: t('Do you really want to delete this archive?',
-          { count: downloadIds.length, replace: { count: downloadIds.length } })
-        + '\n' + downloadNames.join('\n'),
-      }, [
-          { label: 'Cancel' },
-          { label: 'Remove', action: () => downloadIds.forEach(removeId) },
-      ]);
-    }
+    onShowDialog('question', 'Confirm Removal', {
+      text: t('Do you really want to delete this archive?',
+        { count: downloadIds.length, replace: { count: downloadIds.length } }),
+      message: downloadNames.join('\n'),
+    }, [
+        { label: 'Cancel' },
+        { label: 'Remove', action: () => downloadIds.forEach(removeId) },
+    ]);
   }
 
   private removable = (downloadIds: string[]) => {
@@ -384,13 +387,13 @@ class DownloadView extends ComponentEx<IDownloadViewProps, IComponentState> {
               action: () => this.context.api.events.emit('remove-download', downloadId) },
             { label: 'Close' },
         ];
-      if (download.failCause.htmlFile !== undefined) {
+      if ((download.failCause !== undefined) && (download.failCause.htmlFile !== undefined)) {
         onShowDialog('error', 'Download failed', {
           htmlFile: download.failCause.htmlFile,
         }, actions);
-      } else if (download.failCause.message) {
+      } else if ((download.failCause !== undefined) && truthy(download.failCause.message)) {
         onShowDialog('error', 'Download failed', {
-          message: download.failCause.message,
+          text: download.failCause.message,
         }, actions);
       } else {
         onShowDialog('error', 'Download failed', {
@@ -417,14 +420,23 @@ class DownloadView extends ComponentEx<IDownloadViewProps, IComponentState> {
     if (type === 'urls') {
       dlPaths.forEach(url => this.context.api.events.emit('start-download', [url], {}, undefined,
         (error: Error) => {
-        if ((error !== null) && !(error instanceof DownloadIsHTML) && !(error instanceof UserCanceled)) {
+        if ((error !== null)
+            && !(error instanceof DownloadIsHTML)
+            && !(error instanceof UserCanceled)) {
           if (error instanceof ProcessCanceled) {
             this.context.api.showErrorNotification('Failed to start download',
               error.message, {
               allowReport: false,
             });
+          } else if (error.message.match(/Protocol .* not supported/) !== null) {
+            this.context.api.showErrorNotification('Failed to start download',
+              error.message, {
+              allowReport: false,
+            });
           } else {
-            this.context.api.showErrorNotification('Failed to start download', error);
+            this.context.api.showErrorNotification('Failed to start download', error, {
+              allowReport: false,
+            });
           }
         }
       }));

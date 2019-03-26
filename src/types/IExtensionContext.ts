@@ -37,8 +37,10 @@ import * as Redux from 'redux';
 import { ThunkDispatch } from 'redux-thunk';
 
 export { TestSupported, IInstallResult, IInstruction, IDeployedFile, IDeploymentMethod,
-         IFileChange, ILookupResult, IModInfo, IReference, InstallFunc, ISupportedResult, ProgressDelegate };
+         IFileChange, ILookupResult, IModInfo, IReference, InstallFunc, ISupportedResult,
+         ProgressDelegate };
 
+// tslint:disable-next-line:interface-name
 export interface ThunkStore<S> extends Redux.Store<S> {
   dispatch: ThunkDispatch<S, null, Redux.Action>;
 }
@@ -152,6 +154,7 @@ export interface IOpenOptions {
   title?: string;
   defaultPath?: string;
   filters?: IFileFilter[];
+  create?: boolean;
 }
 
 export type StateChangeCallback =
@@ -182,7 +185,7 @@ export type PersistorKey = string[];
  * @interface IPersistor
  */
 export interface IPersistor {
-  setResetCallback(cb: () => void): void;
+  setResetCallback(cb: () => Promise<void>): void;
   getItem(key: PersistorKey): Promise<string>;
   setItem(key: PersistorKey, value: string): Promise<void>;
   removeItem(key: PersistorKey): Promise<void>;
@@ -235,6 +238,8 @@ export interface IGameDetail {
 
 export interface IErrorOptions {
   id?: string;
+  message?: string;
+  isBBCode?: boolean;
   isHTML?: boolean;
   allowReport?: boolean;
   hideDetails?: boolean;
@@ -278,6 +283,7 @@ export interface IRunOptions {
   env?: { [key: string]: string };
   suggestDeploy?: boolean;
   shell?: boolean;
+  detach?: boolean;
 }
 
 /**
@@ -322,7 +328,12 @@ export interface IExtensionApi {
    * show a dialog
    */
   showDialog?: (type: DialogType, title: string, content: IDialogContent,
-                actions: DialogActions) => Promise<IDialogResult>;
+                actions: DialogActions, id?: string) => Promise<IDialogResult>;
+
+  /**
+   * close a dialog
+   */
+  closeDialog?: (id: string, actionKey?: string, input?: any) => void;
 
   /**
    * hides a notification by its id
@@ -446,6 +457,13 @@ export interface IExtensionApi {
   lookupModReference: (ref: IReference) => Promise<ILookupResult[]>;
 
   /**
+   * add a meta server
+   * Please note that setting a server with the same id again will replace the existing one
+   * with that id and setting it to undefined removes it
+   */
+  addMetaServer: (id: string, server?: any) => void;
+
+  /**
    * find meta information about a mod
    * this will calculate a hash and the file size of the specified file
    * for the lookup unless those details are already provided.
@@ -502,13 +520,14 @@ export interface IExtensionApi {
   /**
    * emit an event and allow every receiver to return a Promise. This call will only return
    * after all these Promises are resolved.
-   * Note that errors are ignored atm, if the listener has an error to report, it has do so itself
    */
   emitAndAwait: (eventName: string, ...args: any[]) => Promise<void>;
 
   /**
    * handle an event emitted with emitAndAwait. The listener can return a promise and the emitter
    * will only return after all promises from handlers are returned.
+   * Note that listeners should report all errors themselves, it is considered a bug if the listener
+   * returns a rejected promise.
    */
   onAsync: (eventName: string, listener: (...args: any[]) => Promise<void>) => void;
 
@@ -527,6 +546,8 @@ export interface IExtensionApi {
 }
 
 export interface IStateVerifier {
+  // Human readable description of the problem, emitted if this verifier detects a problem
+  description: (input: any) => string;
   // the expected datatype
   type?: 'map' | 'string' | 'boolean' | 'number' | 'object' | 'array';
   // if set, can't be undefined
@@ -894,18 +915,19 @@ export interface IExtensionContext {
     (extension: string, apply: (call: IRunParameters) => IRunParameters) => void;
 
   /**
-   * register a hook to be called before Vortex starts any tool and is allowed to replace parameter or
-   * cancel the start by rejecting with ProcessCanceled or UserCanceled.
+   * register a hook to be called before Vortex starts any tool and is allowed to replace parameter
+   * or cancel the start by rejecting with ProcessCanceled or UserCanceled.
    * This could be used as a more powerful replacement for registerInterpreter.
    * Interpreters registered with registerInterpreter will be processed before any hooks are applied
-   * @param {number} priority Hooks are applied in ascending priority order. Please choose priorities
-   *                          with a bit of space between hooks you know about so that other extension
-   *                          developers can insert their own hooks between. non-extension hooks will be
-   *                          applied in steps of 100
+   * @param {number} priority Hooks are applied in ascending priority order. Please choose
+   *                          priorities with a bit of space between hooks you know about so that
+   *                          other extension developers can insert their own hooks between.
+   *                          Non-extension hooks will be applied in steps of 100
    * @param {string} id identifier for the hook. This will only be used for logging
    * @param {function} hook the hook to be called
    */
-  registerStartHook: (priority: number, id: string, hook: (call: IRunParameters) => Promise<IRunParameters>) => void;
+  registerStartHook: (priority: number, id: string,
+                      hook: (call: IRunParameters) => Promise<IRunParameters>) => void;
 
   /**
    * specify that a certain range of versions of vortex is required

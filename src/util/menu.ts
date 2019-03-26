@@ -4,7 +4,8 @@ import ExtensionManager from './ExtensionManager';
 import { debugTranslations, getMissingTranslations } from './i18n';
 import { log } from './log';
 
-import { remote } from 'electron';
+import { remote, webFrame } from 'electron';
+import { setZoomFactor } from '../actions/window';
 
 const { Menu, clipboard } = remote;
 
@@ -15,6 +16,27 @@ const { Menu, clipboard } = remote;
  * @param {ExtensionManager} extensions
  */
 export function initApplicationMenu(extensions: ExtensionManager) {
+
+  const changeZoomFactor = (factor: number) => {
+    if ((factor < 0.5) || (factor > 1.5)) {
+      return;
+    }
+    factor = Math.round(factor * 10) / 10;
+    extensions.getApi().sendNotification({
+      id: 'zoom-factor-changed',
+      type: 'info',
+      message: extensions.getApi().translate('Zoom: {{factor}}%',
+        { replace: { factor: Math.floor(factor * 100) } }),
+      noDismiss: true,
+      displayMS: 2000,
+      localize: {
+        message: false,
+      },
+    });
+    webFrame.setZoomFactor(factor);
+    extensions.getApi().store.dispatch(setZoomFactor(factor));
+  };
+
   const fileMenu: Electron.MenuItemConstructorOptions[] = [
     {
       label: 'Close',
@@ -81,26 +103,47 @@ export function initApplicationMenu(extensions: ExtensionManager) {
         click(item, focusedWindow) {
           recordTranslation = !recordTranslation;
           debugTranslations(recordTranslation);
-          log('info', 'toogle', { recordTranslation, label: viewMenu[viewMenu.length - 1].label });
           const subMenu: Electron.Menu = (menu.items[1] as any).submenu as Electron.Menu;
-          subMenu.items[viewMenu.length - 1].enabled = recordTranslation;
+          subMenu.items[copyTranslationsIdx].enabled = recordTranslation;
         },
       });
+
+      let copyTranslationsIdx = viewMenu.length;
       viewMenu.push({
         label: 'Copy missing translations to clipboard',
         click(item, focusedWindow) {
           clipboard.writeText(JSON.stringify(getMissingTranslations(), undefined, 2));
         },
       });
-      viewMenu[viewMenu.length - 1].enabled = false;
+      viewMenu[copyTranslationsIdx].enabled = false;
     }
+
+    viewMenu.push(...[{
+      label: 'Zoom In',
+      accelerator: 'CmdOrCtrl+Shift+Plus',
+      click(item, focusedWindow) {
+        changeZoomFactor(webFrame.getZoomFactor() + 0.1);
+      },
+    }, {
+      label: 'Zoom Out',
+      accelerator: 'CmdOrCtrl+Shift+-',
+      click(item, focusedWindow) {
+        changeZoomFactor(webFrame.getZoomFactor() - 0.1);
+      },
+    }, {
+      label: 'Reset Zoom',
+      accelerator: 'CmdOrCtrl+0',
+      click() {
+        changeZoomFactor(1.0);
+      },
+    }]);
 
     const menu = Menu.buildFromTemplate([
       { label: 'File', submenu: fileMenu },
       { label: 'View', submenu: viewMenu },
     ]);
     Menu.setApplicationMenu(menu);
-  }
+  };
   refresh();
   return refresh;
 }

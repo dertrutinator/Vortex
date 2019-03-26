@@ -1,14 +1,6 @@
-import update from 'immutability-helper';
 import * as _ from 'lodash';
 import * as React from 'react';
 import * as ReactDOM from 'react-dom';
-
-interface IRect {
-  top: number;
-  bottom: number;
-  left: number;
-  right: number;
-}
 
 export interface IProps {
   container?: HTMLElement;
@@ -34,7 +26,7 @@ class VisibilityProxy extends React.PureComponent<any, {}> {
       VisibilityProxy.sObservers.set(container || null,
           new IntersectionObserver(VisibilityProxy.callback, {
         root: container,
-        rootMargin: '180px 0px 180px 0px',
+        rootMargin: '360px 0px 360px 0px',
       } as any));
     }
     return VisibilityProxy.sObservers.get(container);
@@ -78,6 +70,7 @@ class VisibilityProxy extends React.PureComponent<any, {}> {
       if ((this.mLastVisible !== visible) &&
           (visible || (now - this.mVisibleTime) > 1000.0)) {
         this.mLastVisible = visible;
+        this.mVisibleTime = now;
         this.props.setVisible(visible);
       }
     });

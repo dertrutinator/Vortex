@@ -1,5 +1,5 @@
 import { forgetExtension, setExtensionEnabled } from '../actions/app';
-import { addNotification, dismissNotification } from '../actions/notifications';
+import { addNotification, dismissNotification, closeDialog } from '../actions/notifications';
 import { setExtensionLoadFailures } from '../actions/session';
 
 import { DialogActions, DialogType, IDialogContent, showDialog } from '../actions/notifications';
@@ -23,7 +23,7 @@ import { INotification } from '../types/INotification';
 import { IExtensionLoadFailure, IExtensionState, IState } from '../types/IState';
 
 import { Archive } from './archives';
-import { ProcessCanceled, UserCanceled } from './CustomErrors';
+import { ProcessCanceled, UserCanceled, MissingDependency } from './CustomErrors';
 import { isOutdated } from './errorHandling';
 import getVortexPath from './getVortexPath';
 import lazyRequire from './lazyRequire';
@@ -42,6 +42,7 @@ import { app as appIn, dialog as dialogIn, ipcMain, ipcRenderer, remote } from '
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as I18next from 'i18next';
+import * as _ from 'lodash';
 import { IHashResult, ILookupResult, IModInfo, IReference } from 'modmeta-db';
 import * as modmetaT from 'modmeta-db';
 const modmeta = lazyRequire<typeof modmetaT>(() => require('modmeta-db'));
@@ -349,6 +350,8 @@ class ExtensionManager {
   private mLoadFailures: { [extId: string]: IExtensionLoadFailure[] };
   private mInterpreters: { [ext: string]: (input: IRunParameters) => IRunParameters };
   private mStartHooks: Array<{ priority: number, id: string, hook: (input: IRunParameters) => Promise<IRunParameters> }>;
+  private mProgrammaticMetaServers: { [id: string]: any } = {};
+  private mForceDBReconnect: boolean = false;
 
   constructor(initStore?: Redux.Store<any>, eventEmitter?: NodeJS.EventEmitter) {
     this.mEventEmitter = eventEmitter;
@@ -382,6 +385,7 @@ class ExtensionManager {
       isOutdated: () => isOutdated(),
       onAsync: this.onAsync,
       highlightControl: this.highlightControl,
+      addMetaServer: this.addMetaServer,
     };
     if (initStore !== undefined) {
       // apologies for the sync operation but this needs to happen before extensions are loaded
@@ -455,8 +459,11 @@ class ExtensionManager {
     };
 
     this.mApi.showDialog =
-      (type: DialogType, title: string, content: IDialogContent, actions: DialogActions) => {
-        return store.dispatch(showDialog(type, title, content, actions));
+      (type: DialogType, title: string, content: IDialogContent, actions: DialogActions, id?: string) => {
+        return store.dispatch(showDialog(type, title, content, actions, id));
+      };
+    this.mApi.closeDialog = (id: string, actionKey: string, input: any) => {
+        return store.dispatch(closeDialog(id, actionKey, input))
       };
     this.mApi.dismissNotification = (id: string) => {
       store.dispatch(dismissNotification(id));
@@ -464,11 +471,20 @@ class ExtensionManager {
     this.mApi.store = store;
     this.mApi.onStateChange = this.stateChangeHandler;
 
+    this.mApi.onStateChange(['settings', 'metaserver', 'servers'], () => {
+      this.mForceDBReconnect = true;
+    });
+
     if (ipcRenderer !== undefined) {
       ipcRenderer.on('send-notification',
         (event, notification) => this.mApi.sendNotification(notification));
-      ipcRenderer.on('show-error-notification', (event, message, details, options) =>
-        this.mApi.showErrorNotification(message, details, options || undefined));
+      ipcRenderer.on('show-error-notification', (event, message, details, options, isError) =>  {
+        let data = JSON.parse(details);
+        if (isError) {
+          data = Object.assign(new Error(), data);
+        }
+        this.mApi.showErrorNotification(message, data, options || undefined);
+      });
 
       store.dispatch(setExtensionLoadFailures(this.mLoadFailures));
     }
@@ -486,12 +502,20 @@ class ExtensionManager {
   public setupApiMain<S>(store: Redux.Store<S>, ipc: Electron.WebContents) {
     this.mApi.showErrorNotification =
         (message: string, details: string | Error, options: IErrorOptions) => {
-          // unfortunately it appears we can't send an error object via ipc
-          const errMessage = typeof(details) === 'string'
-            ? details
-            : details.message + '\n' + details.stack;
           try {
-            ipc.send('show-error-notification', message, errMessage, options);
+            // make an attempt to serialise error objects in such a way that they can be reconstructed.
+            const data: any = Object.assign({}, details);
+            if (details instanceof Error) {
+              // details.stack may be a getter, so we have to assign it separately
+              data.stack = details.stack;
+              // stack is also optional. If we don't have one, generate one to this function which is
+              // better than nothing because otherwise the code reconstructing the error will produce a stack
+              // that is completely useless
+              if (data.stack === undefined) {
+                data.stack = (new Error()).stack;
+              }
+            } 
+            ipc.send('show-error-notification', message, JSON.stringify(data), options, details instanceof Error);
           } catch (err) {
             // this may happen if the ipc has already been destroyed
             this.showErrorBox(message, details);
@@ -616,8 +640,10 @@ class ExtensionManager {
     return init.then(() => {
       // reset the moddb if necessary so new settings get used
       if ((this.mModDB === undefined)
+          || this.mForceDBReconnect
           || (gameMode !== this.mModDBGame)
           || (currentKey !== this.mModDBAPIKey)) {
+        this.mForceDBReconnect = false;
         if (this.mModDB !== undefined) {
           return this.mModDB.close()
             .then(() => this.mModDB = undefined);
@@ -643,18 +669,21 @@ class ExtensionManager {
       // TODO: the fallback to nexus api should somehow be set up in nexus_integration, not here
   }
 
+  private getMetaServerList() {
+    const state = this.mApi.store.getState();
+    const servers = getSafe(state, ['settings', 'metaserver', 'servers'], {});
+    
+    return [].concat(
+      Object.keys(this.mProgrammaticMetaServers).map(id => this.mProgrammaticMetaServers[id]),
+      Object.keys(servers).map(id => servers[id])
+    );
+  }
+
   private connectMetaDB(gameId: string, apiKey: string) {
     const dbPath = path.join(app.getPath('userData'), 'metadb');
     return modmeta.ModDB.create(
       dbPath,
-      gameId, [
-        {
-          protocol: 'nexus',
-          url: 'https://api.nexusmods.com/v1',
-          apiKey,
-          cacheDurationSec: 86400,
-        },
-      ], log)
+      gameId, this.getMetaServerList(), log)
       .catch(err => {
         return this.mApi.showDialog('error', 'Failed to connect meta database', {
           text: 'Please check that there is no other instance of Vortex still running.',
@@ -753,9 +782,12 @@ class ExtensionManager {
   private selectFile(options: IOpenOptions) {
     return new Promise<string>((resolve, reject) => {
       const fullOptions: Electron.OpenDialogOptions = {
-        ...options,
+        ..._.omit(options, ['create']),
         properties: ['openFile'],
       };
+      if (options.create === true) {
+        fullOptions.properties.push('promptToCreate');
+      }
       const win = remote !== undefined ? remote.getCurrentWindow() : null;
       dialog.showOpenDialog(win, fullOptions, (fileNames: string[]) => {
         if ((fileNames !== undefined) && (fileNames.length > 0)) {
@@ -771,7 +803,7 @@ class ExtensionManager {
     return new Promise<string>((resolve, reject) => {
       // TODO: make the filter list dynamic based on the list of registered interpreters?
       const fullOptions: Electron.OpenDialogOptions = {
-        ...options,
+        ..._.omit(options, ['create']),
         properties: ['openFile'],
         filters: [
           { name: 'All Executables', extensions: ['exe', 'cmd', 'bat', 'jar', 'py'] },
@@ -794,7 +826,7 @@ class ExtensionManager {
   private selectDir(options: IOpenOptions) {
     return new Promise<string>((resolve, reject) => {
       const fullOptions: Electron.OpenDialogOptions = {
-        ...options,
+        ..._.omit(options, ['create']),
         properties: ['openDirectory'],
       };
       const win = remote !== undefined ? remote.getCurrentWindow() : null;
@@ -809,18 +841,19 @@ class ExtensionManager {
   }
 
   private registerProtocol = (protocol: string, def: boolean,
-                              callback: (url: string) => void) => {
+                              callback: (url: string) => void): boolean => {
     log('info', 'register protocol', { protocol });
+    // make it work when using the development version
+    const args = process.execPath.endsWith('electron.exe')
+      ? [getVortexPath('package'), '-d']
+      : ['-d'];
+
+    let haveToRegister = def && !app.isDefaultProtocolClient(protocol, process.execPath, args)
     if (def) {
-      if (process.execPath.endsWith('electron.exe')) {
-        // make it work when using the development version
-        app.setAsDefaultProtocolClient(protocol, process.execPath,
-          [getVortexPath('package'), '-d']);
-      } else {
-        app.setAsDefaultProtocolClient(protocol, process.execPath, ['-d']);
-      }
+      app.setAsDefaultProtocolClient(protocol, process.execPath, args);
     }
     this.mProtocolHandlers[protocol] = callback;
+    return haveToRegister;
   }
 
   private registerArchiveHandler = (extension: string, handler: ArchiveHandlerCreator) => {
@@ -881,8 +914,10 @@ class ExtensionManager {
     }
     return promise
       .then(() => this.getModDB())
-      .then(modDB => modDB.lookup(detail.filePath, fileMD5,
-          fileSize, detail.gameId))
+      .then(modDB => fileSize !== 0
+        ? modDB.lookup(detail.filePath, fileMD5, fileSize, detail.gameId)
+        : []
+      )
       .then((result: ILookupResult[]) => {
         this.mModDBCache[lookupId] = result;
         return Promise.resolve(result);
@@ -925,10 +960,10 @@ class ExtensionManager {
       .then((handler: IArchiveHandler) => Promise.resolve(new Archive(handler)));
   }
 
-  private applyStartHooks(input: IRunParameters) : Promise<IRunParameters> {
+  private applyStartHooks(input: IRunParameters): Promise<IRunParameters> {
     let updated = input;
     return Promise.each(this.mStartHooks, hook => hook.hook(updated)
-      .then(newParameters => {
+      .then((newParameters: IRunParameters) => {
         updated = newParameters;
       })
       .catch(UserCanceled, err => {
@@ -940,7 +975,13 @@ class ExtensionManager {
         return Promise.reject(err);
       })
       .catch(err => {
-        log('error', 'hook failed', err);
+        if (err instanceof UserCanceled) {
+          log('debug', 'start canceled by user');
+        } else if (err instanceof ProcessCanceled) {
+          log('debug', 'hook canceled start', err.message);
+        } else {
+          log('error', 'hook failed', err);
+        }
         return Promise.reject(err);
       }))
     .then(() => updated);
@@ -974,7 +1015,7 @@ class ExtensionManager {
           const spawnOptions: SpawnOptions = {
             cwd,
             env,
-            detached: true,
+            detached: options.detach !== undefined ? options.detach : true,
             shell: options.shell,
           };
           const child = spawn(runExe, options.shell ? args : args.map(arg => arg.replace(/"/g, '')),
@@ -985,7 +1026,13 @@ class ExtensionManager {
               reject(err);
             })
             .on('close', (code) => {
-              if (code !== 0) {
+              const game = activeGameId(this.mApi.store.getState());
+              if ((game === 'fallout3') && (code === 3221225781)) {
+                // FO3 is dependent on several redistributables being installed to run.
+                //  code 3221225781 suggests that xlive and possibly other redistribs are
+                //  not installed.
+                reject(new MissingDependency());
+              } else if (code !== 0) {
                 // TODO: the child process returns an exit code of 53 for SSE and
                 // FO4, and an exit code of 1 for Skyrim. We don't know why but it
                 // doesn't seem to affect anything
@@ -1021,7 +1068,9 @@ class ExtensionManager {
     let queue = Promise.resolve();
     const enqueue = (prom: Promise<void>) => {
       if (prom !== undefined) {
-        queue = queue.then(() => prom.catch(err => null));
+        queue = queue.then(() => prom.catch(err => {
+          this.mApi.showErrorNotification(`Unhandled error in event "${event}"`, err);
+        }));
       }
     }
 
@@ -1040,7 +1089,11 @@ class ExtensionManager {
           args.push(enqueue);
         }
         // call the listener anyway
-        listener(...args).then(() => null);
+        listener(...args)
+          .then(() => null)
+          .catch(err => {
+            this.mApi.showErrorNotification(`Failed to call event ${event}`, err);
+          });
       } else {
         enqueue(listener(...args));
       }
@@ -1088,7 +1141,6 @@ class ExtensionManager {
           result += `${selector}::after { color: red, content: "${text}" }`;
         }
       } else {
-        console.log('css', highlightCSS);
         result += highlightCSS.cssText.replace('#highlight-control-dummy', selector);
         if (text !== undefined) {
           result += highlightAfterCSS.cssText.replace('#highlight-control-dummy', selector).replace('__contentPlaceholder', text);
@@ -1111,6 +1163,11 @@ class ExtensionManager {
     setTimeout(() => {
       head.removeChild(highlightNode);
     }, duration);
+  }
+
+  private addMetaServer = (id: string, server: any) => {
+    this.mProgrammaticMetaServers[id] = server;
+    this.mForceDBReconnect = true;
   }
 
   private startIPC(ipcPath: string) {
@@ -1150,15 +1207,22 @@ class ExtensionManager {
                                 loadedExtensions: Set<string>): IRegisteredExtension[] {
     if (!fs.existsSync(extensionsPath)) {
       log('info', 'failed to load dynamic extensions, path doesn\'t exist', extensionsPath);
-      fs.mkdirSync(extensionsPath);
+      try {
+        fs.mkdirSync(extensionsPath);
+      } catch (err) {
+        log('warn', 'extension path missing and can\'t be created',
+            { path: extensionsPath, error: err.message});
+      }
       return [];
     }
 
     const res = fs.readdirSync(extensionsPath)
       .filter(name => !loadedExtensions.has(name))
-      .filter(name => getSafe(this.mExtensionState, [name, 'enabled'], true))
       .filter(name => fs.statSync(path.join(extensionsPath, name)).isDirectory())
       .map(name => {
+        if (!getSafe(this.mExtensionState, [name, 'enabled'], true)) {
+          log('debug', 'extension disabled', { name });
+        }
         try {
           // first, mark this extension as loaded. If this is a user extension and there is an
           // extension with the same name in the bundle we could otherwise end up loading the
@@ -1201,6 +1265,7 @@ class ExtensionManager {
       'nexus_integration',
       'download_management',
       'gamemode_management',
+      'announcement_dashlet',
       'symlink_activator',
       'symlink_activator_elevate',
       'hardlink_activator',

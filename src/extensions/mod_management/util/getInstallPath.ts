@@ -13,6 +13,9 @@ export function getInstallPathPattern(pattern: string): string {
 }
 
 function getInstallPath(pattern: string, gameId: string): string {
+  if (gameId === undefined) {
+    throw new Error('gameId can\'t be undefined');
+  }
   if (userData === undefined) {
     // cached to avoid ipcs from renderer -> main process
     userData = app.getPath('userData');
@@ -22,7 +25,20 @@ function getInstallPath(pattern: string, gameId: string): string {
     game: gameId,
   });
 
-  return format(getInstallPathPattern(pattern), formatKeys);
+  let result = format(getInstallPathPattern(pattern), formatKeys);
+
+  // on windows a path of the form \foo\bar or /foo/bar will be identified as absolute
+  // even though it's not, it just isn't. It is relative to the drive of the current working
+  // directory - which makes no fing sense since windows is supposed to have separate cwds
+  // per drive and ... uuuuugh windows...
+  if (!path.isAbsolute(result)
+      || ((process.platform === 'win32')
+          && ((result[0] === '\\') && (result[1] !== '\\'))
+              || (result[0] === '/') && (result[1] !== '/'))) {
+    result = path.resolve(app.getAppPath(), result);
+  }
+
+  return result;
 }
 
 export default getInstallPath;

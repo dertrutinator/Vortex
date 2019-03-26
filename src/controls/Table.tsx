@@ -7,11 +7,12 @@ import {IRowState, IState, ITableState} from '../types/IState';
 import {ITableAttribute} from '../types/ITableAttribute';
 import {SortDirection} from '../types/SortDirection';
 import {ComponentEx, connect, extend, translate} from '../util/ComponentEx';
+import Debouncer from '../util/Debouncer';
 import {IExtensibleProps} from '../util/ExtensionProvider';
 import { log } from '../util/log';
 import smoothScroll from '../util/smoothScroll';
 import { getSafe, setSafe } from '../util/storeHelper';
-import {truthy} from '../util/util';
+import {sanitizeCSSId, truthy} from '../util/util';
 
 import IconBar from './IconBar';
 import HeaderCell from './table/HeaderCell';
@@ -19,15 +20,16 @@ import { Table, TBody, TH, THead, TR } from './table/MyTable';
 import TableDetail from './table/TableDetail';
 import TableRow from './table/TableRow';
 import ToolbarIcon from './ToolbarIcon';
+import Usage from './Usage';
 
 import * as Promise from 'bluebird';
 import update from 'immutability-helper';
 import * as _ from 'lodash';
 import * as React from 'react';
+import { Button } from 'react-bootstrap';
 import * as ReactDOM from 'react-dom';
 import * as Redux from 'redux';
-import { createSelector } from 'reselect';
-import { Button } from 'react-bootstrap';
+import { createSelector, OutputSelector } from 'reselect';
 
 export type ChangeDataHandler = (rowId: string, attributeId: string, newValue: any) => void;
 
@@ -95,13 +97,12 @@ type IProps = IBaseProps & IConnectedProps & IActionProps & IExtensionProps & II
  * - a detail-pane that gives additional detail on the (last) selected row
  */
 class SuperTable extends ComponentEx<IProps, IComponentState> {
-  // minimum distance of the focused item to the table header when navigating with the
-  // keyboard
-  private static SCROLL_OFFSET = 100;
   private static SCROLL_DURATION = 200;
+  // delay certain actions (like hiding offscreen items) until after scrolling ends.
+  // this improves scroll smoothness at the expense of memory
+  private static SCROLL_DEBOUNCE = 5000;
 
   private mVisibleAttributes: ITableAttribute[];
-  private mHeadRef: HTMLElement;
   private mPinnedRef: HTMLElement;
   private mScrollRef: HTMLElement;
   private mRowRefs: { [id: string]: HTMLElement } = {};
@@ -113,6 +114,13 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
   private mUpdateInProgress: boolean = false;
   private mNextState: IComponentState = undefined;
   private mNextVisibility: { [id: string]: boolean } = {};
+  private mDelayedVisibility: { [id: string]: boolean } = {};
+  private mDelayedVisibilityTimer: NodeJS.Timer;
+  private mProxyHeaderRef: HTMLElement;
+  private mVisibleHeaderRef: HTMLElement;
+  private mHeaderUpdateDebouncer: Debouncer;
+  private mUpdateCalculatedDebouncer: Debouncer;
+  private mLastScroll: number;
   private mWillSetVisibility: boolean = false;
   private mMounted: boolean = false;
   private mNoShrinkColumns: { [attributeId: string]: HeaderCell } = {};
@@ -140,6 +148,20 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
       }
       return null;
     });
+
+    this.mHeaderUpdateDebouncer = new Debouncer(() => {
+      this.updateColumnWidth();
+      return Promise.resolve();
+    }, 200, false);
+
+    this.mUpdateCalculatedDebouncer = new Debouncer(() => {
+      return this.updateCalculatedValues(this.props)
+        .then(changedColumns => {
+          this.refreshSorted(this.mNextUpdateState);
+          this.updateSelection(this.mNextUpdateState);
+          return null;
+        });
+    }, 200, true);
   }
 
   public componentWillMount() {
@@ -200,12 +222,7 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     if ((newProps.data !== this.props.data)
         || (newProps.dataId !== this.props.dataId)
         || (newProps.objects !== this.props.objects)) {
-      this.updateCalculatedValues(newProps)
-      .then(changedColumns => {
-        this.refreshSorted(this.mNextUpdateState);
-        this.updateSelection(this.mNextUpdateState);
-        return null;
-      });
+      this.mUpdateCalculatedDebouncer.schedule();
     } else if ((newProps.attributeState !== this.props.attributeState)
             || (newProps.language !== this.props.language)
             || (newProps.filter !== this.props.filter)) {
@@ -213,24 +230,30 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     }
   }
 
+  public componentDidUpdate() {
+    this.mHeaderUpdateDebouncer.schedule();
+  }
+
+  public shouldComponentUpdate(newProps: IProps, newState: IComponentState) {
+    return (
+      (newState !== this.state)
+      || (newProps.dataId !== this.props.dataId)
+      || (newProps.tableId !== this.props.tableId)
+      || (newProps.actions !== this.props.actions)
+      || (newProps.attributeState !== this.props.attributeState)
+      || (newProps.filter !== this.props.filter)
+      || (newProps.defaultSort !== this.props.defaultSort)
+      || (newProps.showHeader !== this.props.showHeader)
+      || (newProps.detailsTitle !== this.props.detailsTitle)
+      || (newProps.showDetails !== this.props.showDetails)
+    );
+  }
+
   public render(): JSX.Element {
-    const { t, actions, data, showHeader, showDetails, tableId } = this.props;
-    const { detailsOpen, singleRowActions, sortedRows } = this.state;
+    const { showHeader, showDetails, tableId } = this.props;
+    const { detailsOpen } = this.state;
 
-    let hasActions = false;
-    if (actions !== undefined) {
-      hasActions = singleRowActions.length > 0;
-    }
-
-    const actionHeader = this.renderTableActions(hasActions);
     const openClass = detailsOpen ? 'open' : 'closed';
-
-    const scrollOffset = this.mScrollRef !== undefined ? this.mScrollRef.scrollTop : 0;
-    const headerStyle = { transform: `translate(0, ${scrollOffset}px)` };
-
-    const filteredLength = sortedRows !== undefined ? sortedRows.length : undefined;
-    const totalLength = Object.keys(data).length;
-    const filterActive = (filteredLength !== undefined) && (filteredLength < totalLength);
 
     return (
       <div id={`table-${tableId}`} className='table-container'>
@@ -242,38 +265,65 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
             onKeyDown={this.handleKeyDown}
           >
             <Table hover>
-              {this.renderBody(this.mVisibleAttributes)}
-              {/* header below body so content in the table can't overlap the header */}
-              {showHeader === false ? null : <THead
-                className='table-header'
-                domRef={this.setHeadRef}
-                style={headerStyle}
-              >
-                <TR>
-                  {this.mVisibleAttributes.map(this.renderHeaderField)}
-                  {actionHeader}
-                </TR>
-                {filterActive ? (
-                  <TR className='table-pinned' domRef={this.setPinnedRef}>
-                    <div>
-                      {t('This table is filtered, showing {{shown}}/{{hidden}} items.',
-                        { replace: { shown: filteredLength, hidden: totalLength } })}
-                      <Button onClick={this.clearFilters}>{t('Clear all filters')}</Button>
-                    </div>
-                  </TR>
-                ) : null}
-              </THead>
-              }
+              {showHeader === false ? null : this.renderHeader(true)}
+              {this.renderBody()}
             </Table>
             {this.props.children}
           </div>
           {this.renderFooter()}
         </div>
+        {showHeader === false ? null : (
+          <div
+            className='table-header-pane'
+          >
+            <Table hover>
+              {this.renderHeader(false)}
+            </Table>
+          </div>)}
         {showDetails === false ? null : (
           <div className={`table-details-pane ${openClass}`}>
             {this.renderDetails()}
           </div>)}
       </div>
+    );
+  }
+
+  private renderHeader(proxy: boolean): JSX.Element {
+    const { t, actions, data } = this.props;
+    const { singleRowActions, sortedRows } = this.state;
+
+    let hasActions = false;
+    if (actions !== undefined) {
+      hasActions = singleRowActions.length > 0;
+    }
+
+    const filteredLength = sortedRows !== undefined ? sortedRows.length : undefined;
+    const totalLength = Object.keys(data).length;
+
+    const actionHeader = this.renderTableActions(hasActions);
+    const filterActive = (filteredLength !== undefined) && (filteredLength < totalLength);
+
+    return (
+      <THead
+        className='table-header'
+      >
+        <TR
+          domRef={proxy ? this.setProxyHeaderRef : this.setVisibleHeaderRef}
+        >
+
+          {this.mVisibleAttributes.map(attribute => this.renderHeaderField(attribute, proxy))}
+          {actionHeader}
+        </TR>
+        {filterActive ? (
+          <TR className='table-pinned' domRef={this.setPinnedRef}>
+            <div>
+              {t('This table is filtered, showing {{shown}}/{{hidden}} items.',
+                { replace: { shown: filteredLength, hidden: totalLength } })}
+              <Button onClick={this.clearFilters}>{t('Clear all filters')}</Button>
+            </div>
+          </TR>
+        ) : null}
+      </THead>
     );
   }
 
@@ -283,8 +333,17 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
 
     const selected = Object.keys(rowState).filter(key => rowState[key].selected);
 
-    if ((multiRowActions.length === 0) || (selected.length < 2)) {
+    if ((multiRowActions.length === 0) || !this.useMultiSelect()) {
       return null;
+    }
+
+    if (selected.length < 2) {
+      return (
+        <Usage infoId='table-multiselect'>
+          {t('Did you know? You can select multiple items using ctrl+click or shift+click or '
+            + 'select everything using ctrl+a and then do things with all selected items at once.')}
+        </Usage>
+      );
     }
 
     // the footer itself (.table-footer) is absolutely positioned so it fills out a surrounding
@@ -297,12 +356,13 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
             t={t}
             className='menubar'
             group={`${tableId}-multirow-actions`}
+            groupByIcon={false}
             instanceId={selected}
             staticElements={multiRowActions}
           />
 
           <div className='menubar'>
-            <p>{t('{{count}} item selected', { count: selected.length })}</p>
+            <p>{t('{{ count }} item selected', { count: selected.length })}</p>
             <ToolbarIcon
               key='btn-deselect'
               icon='deselect'
@@ -315,18 +375,21 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     );
   }
 
-  private renderBody = (visibleAttributes: ITableAttribute[]) => {
-    const { data } = this.props;
+  private renderBody = () => {
+    const { attributeState, data } = this.props;
     const { calculatedValues, sortedRows } = this.state;
 
     if ((data === undefined) || (calculatedValues === undefined) || (sortedRows === undefined)) {
       return <TBody />;
     }
 
+    const sortAttribute: ITableAttribute = this.mVisibleAttributes.find(attribute =>
+      this.isSortColumn(attributeState[attribute.id]));
+
     return (
       <TBody>
         {sortedRows.map((row, idx) =>
-          this.renderRow(row, visibleAttributes))}
+          this.renderRow(row, sortAttribute))}
       </TBody>
     );
   }
@@ -336,10 +399,14 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
       const node = ReactDOM.findDOMNode(this.mRowRefs[id]) as HTMLElement;
       if (node !== null) {
         this.scrollToItem(node, false);
+      } else if (mayRetry !== false) {
+        setTimeout(() => {
+          this.scrollTo(id, false);
+        }, 2000);
+      } else {
+        console.log('node not found', this.mRowRefs);
       }
     } catch (err) {
-      // nop. I think this can happen if the event is emitted before the window has
-      // been activated
       if (mayRetry !== false) {
         setTimeout(() => {
           this.scrollTo(id, false);
@@ -417,12 +484,16 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
       return pos++;
     };
 
+    const toggleableColumns = objects.filter(attr => attr.isToggleable);
+    if (toggleableColumns.length === 0) {
+      return [];
+    }
+
     return [{
       icon: null,
       title: t('Toggle Columns'),
       position: getPos(),
-    }].concat(objects
-      .filter(attr => attr.isToggleable)
+    }].concat(toggleableColumns
       .map(attr => {
         const attributeState = this.getAttributeState(attr, props.attributeState);
         return {
@@ -466,9 +537,8 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
       && (attributeState.sortDirection !== 'none');
   }
 
-  private renderRow(rowId: string,
-                    visibleAttributes: ITableAttribute[]): JSX.Element {
-    const { t, attributeState, data, language, tableId } = this.props;
+  private renderRow(rowId: string, sortAttribute: ITableAttribute): JSX.Element {
+    const { t, data, language, tableId } = this.props;
     const { calculatedValues, rowState, singleRowActions } = this.state;
 
     if ((calculatedValues[rowId] === undefined) || (data[rowId] === undefined)) {
@@ -477,18 +547,17 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
 
     const attributes = this.mVisibleAttributes;
 
-    const sortAttribute: ITableAttribute = attributes.find(attribute =>
-      this.isSortColumn(attributeState[attribute.id]));
+    const tableRowId = sanitizeCSSId(rowId);
 
     return (
       <TableRow
         t={t}
         tableId={tableId}
-        id={rowId}
-        key={rowId}
+        id={tableRowId}
+        key={tableRowId}
         data={calculatedValues[rowId]}
         rawData={data[rowId]}
-        attributes={visibleAttributes}
+        attributes={attributes}
         sortAttribute={sortAttribute !== undefined ? sortAttribute.id : undefined}
         actions={singleRowActions}
         language={language}
@@ -504,7 +573,7 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     );
   }
 
-  private renderHeaderField = (attribute: ITableAttribute): JSX.Element => {
+  private renderHeaderField = (attribute: ITableAttribute, proxy: boolean): JSX.Element => {
     const { t, filter } = this.props;
 
     const attributeState = this.getAttributeState(attribute);
@@ -533,7 +602,7 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
           doFilter={true}
           onSetSortDirection={this.setSortDirection}
           onSetFilter={this.setFilter}
-          ref={this.setHeaderCellRef}
+          ref={proxy ? this.setHeaderCellRef : undefined}
           t={t}
         >
           {attribute.filter !== undefined ? (
@@ -601,7 +670,7 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     if (offset !== 0) {
       evt.preventDefault();
       const newItem = this.selectRelative(offset);
-      if (this.mRowRefs[newItem] !== undefined) {
+      if ((this.mRowRefs[newItem] !== undefined) && this.mMounted) {
         this.scrollToItem(
           ReactDOM.findDOMNode(this.mRowRefs[newItem]) as HTMLElement, Math.abs(offset) > 1);
       }
@@ -677,8 +746,29 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     return newSelection;
   }
 
-  private setHeadRef = ref => {
-    this.mHeadRef = ref;
+  private setProxyHeaderRef = ref => {
+    this.mProxyHeaderRef = ref;
+    this.mHeaderUpdateDebouncer.schedule();
+  }
+
+  private setVisibleHeaderRef = ref => {
+    this.mVisibleHeaderRef = ref;
+    this.mHeaderUpdateDebouncer.schedule();
+  }
+
+  private updateColumnWidth() {
+    if (!truthy(this.mProxyHeaderRef) || !truthy(this.mVisibleHeaderRef)) {
+      return;
+    }
+
+    this.mProxyHeaderRef.childNodes.forEach((node, index) => {
+      (this.mVisibleHeaderRef.childNodes.item(index) as HTMLElement).style.minWidth =
+        (this.mVisibleHeaderRef.childNodes.item(index) as HTMLElement).style.maxWidth =
+          `${(node as HTMLElement).clientWidth}px`;
+    });
+
+    const height = this.mVisibleHeaderRef.clientHeight;
+    this.mScrollRef.style['marginTop'] = `${height}px`;
   }
 
   private setPinnedRef = ref => {
@@ -687,13 +777,23 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
 
   private setRowRef = (ref: any) => {
     if (ref !== null) {
-      this.mRowRefs[ref.props.id] = ref;
+      this.mRowRefs[ref.props['data-rowid']] = ref;
     }
   }
 
   private setRowVisible = (rowId: string, visible: boolean) => {
-    this.mNextVisibility[rowId] = visible;
-    this.triggerUpdateVisibility();
+    // turn rows visible asap, turning them invisible can be done when scrolling ends
+    if (visible || (this.mDelayedVisibilityTimer === undefined)) {
+      this.mNextVisibility[rowId] = visible;
+      this.mDelayedVisibility[rowId] = visible;
+      // it's possible that a previous visibility change hadn't even been
+      // rendered yet, in this case we don't have to trigger an update
+      if (visible !== this.state.rowVisibility[rowId]) {
+        this.triggerUpdateVisibility();
+      }
+    } else {
+      this.mDelayedVisibility[rowId] = visible;
+    }
   }
 
   private triggerUpdateVisibility() {
@@ -701,8 +801,19 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
       this.mWillSetVisibility = true;
       window.requestAnimationFrame(() => {
         this.mWillSetVisibility = false;
-        this.updateState(setSafe(this.mNextState, ['rowVisibility'], this.mNextVisibility));
+        this.updateState(setSafe(this.mNextState, ['rowVisibility'], { ...this.mNextVisibility }));
       });
+    }
+  }
+
+  private postScroll() {
+    if ((Date.now() - this.mLastScroll) < SuperTable.SCROLL_DEBOUNCE) {
+      this.mDelayedVisibilityTimer = setTimeout(() =>
+        this.postScroll(), SuperTable.SCROLL_DEBOUNCE + 100);
+    } else {
+      this.mDelayedVisibilityTimer = undefined;
+      this.mNextVisibility = { ...this.mDelayedVisibility };
+      this.triggerUpdateVisibility();
     }
   }
 
@@ -710,35 +821,52 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     this.updateState(setSafe(this.mNextState, ['rowState', rowId, 'highlighted'], highlighted));
   }
 
-  private scrollToItem = (item: HTMLElement, smooth: boolean) => {
-    const topLimit = this.mScrollRef.scrollTop + SuperTable.SCROLL_OFFSET;
+  private scrollToItem = (item: HTMLElement, smooth: boolean, iterations: number = 3) => {
+    const height = this.mScrollRef.offsetHeight;
+    const offset = height / 5;
+    const topLimit = this.mScrollRef.scrollTop + offset;
     const bottomLimit =
-      this.mScrollRef.scrollTop + this.mScrollRef.clientHeight - SuperTable.SCROLL_OFFSET;
+      this.mScrollRef.scrollTop + this.mScrollRef.clientHeight - offset;
     const itemBottom = item.offsetTop + item.offsetHeight;
 
     let targetPos: number;
     if (item.offsetTop < topLimit) {
-      targetPos = Math.max(item.offsetTop - SuperTable.SCROLL_OFFSET, 0);
+      targetPos = Math.max(item.offsetTop - offset, 0);
     } else if (itemBottom > bottomLimit) {
-      targetPos = itemBottom - this.mScrollRef.clientHeight + SuperTable.SCROLL_OFFSET;
+      targetPos = itemBottom - this.mScrollRef.clientHeight + offset;
     }
-    if ((targetPos !== undefined) && (targetPos !== this.mScrollRef.scrollTop)) {
+    if ((targetPos !== undefined)
+        && (targetPos !== this.mScrollRef.scrollTop)) {
       if (smooth) {
-        smoothScroll(this.mScrollRef, targetPos, SuperTable.SCROLL_DURATION);
+        smoothScroll(this.mScrollRef, targetPos, SuperTable.SCROLL_DURATION)
+          .then(() => (iterations > 0)
+            ? this.scrollToItem(item, smooth)
+            : Promise.resolve());
       } else {
         this.mScrollRef.scrollTop = targetPos;
+
+        if (iterations > 0) {
+          // workaround: since we're not rendering off-screen rows it's possible for row heights to
+          //  change as we scroll and then the offset we calculated might not be in the visible
+          //  range after all.
+          setTimeout(() => {
+            this.scrollToItem(item, smooth, iterations - 1);
+          }, 100);
+        }
       }
     }
   }
 
-  private translateHeader = (event) => {
+  private onScroll = (event) => {
+    this.mLastScroll = Date.now();
+    if (this.mDelayedVisibilityTimer === undefined) {
+      this.mDelayedVisibilityTimer = setTimeout(() =>
+        this.postScroll(), SuperTable.SCROLL_DEBOUNCE + 100);
+    }
     window.requestAnimationFrame(() => {
-      if ((this.mHeadRef !== undefined) && (this.mHeadRef !== null)) {
-        const transform = `translateY(${event.target.scrollTop}px)`;
-        this.mHeadRef.style.transform = transform;
-      }
       if (truthy(this.mPinnedRef)) {
-        this.mPinnedRef.className = event.target.scrollTop === 0 ? 'table-pinned' : 'table-pinned-hidden';
+        this.mPinnedRef.className =
+          event.target.scrollTop === 0 ? 'table-pinned' : 'table-pinned-hidden';
       }
     });
     Object.keys(this.mNoShrinkColumns).forEach(colId => {
@@ -752,10 +880,10 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     }
 
     // not sure if this is necessary, I guess not
-    ref.removeEventListener('scroll', this.translateHeader);
+    ref.removeEventListener('scroll', this.onScroll);
 
     // translate the header so that it remains in view during scrolling
-    ref.addEventListener('scroll', this.translateHeader);
+    ref.addEventListener('scroll', this.onScroll);
     this.mScrollRef = ref;
   }
 
@@ -997,17 +1125,18 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     }
 
     const row = (evt.currentTarget as HTMLTableRowElement);
+    const rowId = row.getAttribute('data-rowid');
 
     if (this.useMultiSelect() && evt.ctrlKey) {
       // ctrl-click -> toggle the selected row, leave remaining selection intact
-      this.selectToggle(row.id);
+      this.selectToggle(rowId);
     } else if (this.useMultiSelect() && evt.shiftKey) {
       // shift-click -> select everything between this row and the last one clicked,
       //                deselect everything else
-      this.selectTo(row.id);
+      this.selectTo(rowId);
     } else {
       // regular click -> select only the clicked row, everything else get deselected
-      this.selectOnly(row.id, true);
+      this.selectOnly(rowId, true);
     }
   }
 
@@ -1041,13 +1170,13 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
   private selectToggle(rowId: string) {
     const wasSelected = getSafe(this.state.rowState, [rowId, 'selected'], undefined);
     if (!wasSelected) {
+      const rowState = wasSelected === undefined
+            ? { $set: { selected: true } }
+            : { selected: { $set: !wasSelected } };
       this.updateState(update(this.mNextState, {
         lastSelected: { $set: rowId },
-        rowState: { [rowId]:
-          wasSelected === undefined
-            ? { $set: { selected: true } }
-            : { selected: { $set: !wasSelected } },
-        }}), this.onRowStateChanged);
+        rowState: { [rowId]: rowState },
+        }), this.onRowStateChanged);
     } else {
       this.updateState(update(this.mNextState, {
         rowState: { [rowId]: { selected: { $set: !wasSelected } } },
@@ -1107,7 +1236,7 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
       if (selecting) {
         selection.add(iterId);
         if (isBracket) {
-          selecting = false;;
+          selecting = false;
         }
       }
     });
@@ -1126,7 +1255,7 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
     return attributes.filter((attribute: ITableAttribute) => {
       if ((attribute.condition !== undefined) && !attribute.condition()) {
         return false;
-      } 
+      }
       const state = this.getAttributeState(attribute, attributeStates);
       if (attribute.placement === 'detail') {
         return false;
@@ -1181,6 +1310,12 @@ class SuperTable extends ComponentEx<IProps, IComponentState> {
   }
 
   private updateState(newState: IComponentState, callback?: () => void) {
+    if (_.isEqual(newState, this.state)) {
+      if (callback !== undefined) {
+        callback();
+      }
+      return;
+    }
     this.mNextState = newState;
     if (this.mMounted) {
       this.setState(newState, callback);
@@ -1224,7 +1359,9 @@ function getTableState(state: IState, tableId: string) {
   return state.settings.tables[tableId];
 }
 
-export function makeGetSelection(tableId: string) {
+type GetSelection = OutputSelector<any, string[], (res: ITableState) => string[]>;
+
+export function makeGetSelection(tableId: string): GetSelection {
   const getTableStateInst = (state: any) => getTableState(state, tableId);
   return createSelector(getTableStateInst, (tableState: ITableState) => {
     return Object.keys(tableState.rows).filter((rowId: string) => (

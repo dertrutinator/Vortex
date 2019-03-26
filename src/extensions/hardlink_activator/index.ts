@@ -4,16 +4,19 @@ import * as fs from '../../util/fs';
 import { log } from '../../util/log';
 import { installPathForGame } from '../../util/selectors';
 
-import { getGame } from '../gamemode_management/util/getGame';
 import { IDiscoveryResult } from '../gamemode_management/types/IDiscoveryResult';
+import { getGame } from '../gamemode_management/util/getGame';
 import LinkingDeployment from '../mod_management/LinkingDeployment';
-import { IDeployedFile, IDeploymentMethod } from '../mod_management/types/IDeploymentMethod';
+import { IDeployedFile, IDeploymentMethod,
+         IUnavailableReason } from '../mod_management/types/IDeploymentMethod';
 
 import * as Promise from 'bluebird';
 import * as I18next from 'i18next';
 import * as path from 'path';
 import turbowalk from 'turbowalk';
 import * as util from 'util';
+import * as winapi from 'winapi-bindings';
+import { setSettingsPage } from '../../actions/session';
 
 export class FileFound extends Error {
   constructor(name) {
@@ -24,6 +27,7 @@ export class FileFound extends Error {
 
 class DeploymentMethod extends LinkingDeployment {
   private mDirCache: Set<string>;
+  private mInstallationFiles: Set<number>;
 
   constructor(api: IExtensionApi) {
     super(
@@ -55,21 +59,36 @@ class DeploymentMethod extends LinkingDeployment {
       + 'a copy.');
   }
 
-  public isSupported(state: any, gameId: string, typeId: string): string {
+  public isSupported(state: any, gameId: string, typeId: string): IUnavailableReason {
     const discovery: IDiscoveryResult = state.settings.gameMode.discovered[gameId];
     if (discovery === undefined) {
-      return 'No game discovery';
+      return {
+        description: t => t('Game not discovered.'),
+      };
     }
 
     const game: IGame = getGame(gameId);
     const modPaths = game.getModPaths(discovery.path);
+
+    if (modPaths[typeId] === undefined) {
+      return undefined;
+    }
 
     try {
       fs.accessSync(modPaths[typeId], fs.constants.W_OK);
     } catch (err) {
       log('info', 'hardlink deployment not supported due to lack of write access',
           { typeId, path: modPaths[typeId] });
-      return `Can\'t write to output directory: ${modPaths[typeId]}`;
+      return {
+        description: t => t('Can\'t write to output directory.'),
+        order: 3,
+        solution: t => t('To resolve this problem, the current user account needs to be given '
+                       + 'write permission to "{{modPath}}".', {
+          replace: {
+            modPath: modPaths[typeId],
+          },
+        }),
+      };
     }
 
     const installationPath = installPathForGame(state, gameId);
@@ -77,9 +96,23 @@ class DeploymentMethod extends LinkingDeployment {
     try {
       if (fs.statSync(installationPath).dev !== fs.statSync(modPaths[typeId]).dev) {
         // hard links work only on the same drive
-        return 'Works only if mods are installed on the same drive as the game. '
-          + 'You can go to settings and change the mod directory to the same drive '
-          + 'as the game.';
+        return {
+          description: t => t('Works only if mods are installed on the same drive as the game.'),
+          order: 5,
+          solution: t => t('Please go to Settings->Mods and set the mod staging folder to be on '
+            + 'the same drive as the game ({{gameVolume}}).', {
+              replace: {
+                gameVolume: winapi.GetVolumePathName(modPaths[typeId]),
+              },
+            }),
+          fixCallback: (api: IExtensionApi) => new Promise((resolve, reject) => {
+            api.events.emit('show-main-page', 'application_settings');
+            api.store.dispatch(setSettingsPage('Mods'));
+            api.highlightControl('#install-path-form',
+                                 5000,
+                                 'Change this to be on the same drive as the game.');
+          }),
+        };
       }
     } catch (err) {
       // this can happen when managing the the game for the first time
@@ -87,7 +120,9 @@ class DeploymentMethod extends LinkingDeployment {
         dir1: installationPath || 'undefined', dir2: modPaths[typeId],
         err: util.inspect(err),
       });
-      return 'Game not fully initialized yet, this should disappear soon.';
+      return {
+        description: t => t('Game not fully initialized yet, this should disappear soon.'),
+      };
     }
 
     const canary = path.join(installationPath, '__vortex_canary.tmp');
@@ -98,7 +133,10 @@ class DeploymentMethod extends LinkingDeployment {
     } catch (err) {
       // EMFILE shouldn't keep us from using hard linking
       if (err.code !== 'EMFILE') {
-        return 'Filesystem doesn\'t support hard links';
+        // the error code we're actually getting is EISDIR, which makes no sense at all
+        return {
+          description: t => t('Filesystem doesn\'t support hard links.'),
+        };
       }
     }
 
@@ -114,7 +152,8 @@ class DeploymentMethod extends LinkingDeployment {
         .then(() => fs.removeAsync(canary))
         .catch(err => {
           log('error', 'failed to clean up canary file. This indicates we were able to create '
-              + 'a file in the target directory but not delete it', { installationPath, message: err.message });
+              + 'a file in the target directory but not delete it',
+              { installationPath, message: err.message });
         });
     }
 
@@ -133,37 +172,52 @@ class DeploymentMethod extends LinkingDeployment {
     });
   }
 
+  public postPurge(): Promise<void> {
+    delete this.mInstallationFiles;
+    return Promise.resolve();
+  }
+
   protected purgeLinks(installationPath: string, dataPath: string): Promise<void> {
-    const inos = new Set<number>();
-    const deleteIfEmpty: string[] = [];
+    let installEntryProm: Promise<Set<number>>;
 
     // find ids of all files in our mods directory
-    return turbowalk(installationPath,
-                     entries => {
-                       entries.forEach(entry => {
-                         if (entry.linkCount > 1) {
-                           inos.add(entry.id);
-                         }
-                       });
-                     },
-                     {
-                       details: true,
-                     })
-        // now remove all files in the game directory that have the same id
-        .then(() => {
-          let queue = Promise.resolve();
-          return turbowalk(dataPath, entries => {
-            queue = queue
-              .then(() => Promise.map(entries,
-                entry => (entry.linkCount > 1) && inos.has(entry.id)
-                  ? fs.unlinkAsync(entry.filePath)
-                    .catch(err =>
-                      log('warn', 'failed to remove', entry.filePath))
-                  : Promise.resolve(), { concurrency: 100 })
-              .then(() => undefined));
-          }, {details: true})
-          .then(() => queue);
-        });
+    if (this.mInstallationFiles !== undefined) {
+      installEntryProm = Promise.resolve(this.mInstallationFiles);
+    } else {
+      this.mInstallationFiles = new Set<number>();
+      installEntryProm = turbowalk(installationPath,
+        entries => {
+          entries.forEach(entry => {
+            if (entry.linkCount > 1) {
+              this.mInstallationFiles.add(entry.id);
+            }
+          });
+        },
+        {
+          details: true,
+        })
+        .then(() => Promise.resolve(this.mInstallationFiles));
+    }
+
+    // now remove all files in the game directory that have the same id
+    // as a file in the mods directory
+    return installEntryProm.then(inos => {
+      let queue = Promise.resolve();
+      if (inos.size === 0) {
+        return Promise.resolve();
+      }
+      return turbowalk(dataPath, entries => {
+        queue = queue
+          .then(() => Promise.map(entries,
+            entry => (entry.linkCount > 1) && inos.has(entry.id)
+              ? fs.unlinkAsync(entry.filePath)
+                .catch(err =>
+                  log('warn', 'failed to remove', entry.filePath))
+              : Promise.resolve())
+            .then(() => undefined));
+      }, { details: true })
+        .then(() => queue);
+    });
   }
 
   protected linkFile(linkPath: string, sourcePath: string): Promise<void> {

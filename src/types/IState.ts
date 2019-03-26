@@ -146,8 +146,10 @@ export interface ISettingsInterface {
   advanced: boolean;
   profilesVisible: boolean;
   desktopNotifications: boolean;
+  hideTopLevelCategory: boolean;
   dashboardLayout: string[];
   dashletSettings: { [dashletId: string]: IDashletSettings };
+  usage: { [usageId: string]: boolean };
 }
 
 export interface ISettingsAutomation {
@@ -203,6 +205,10 @@ export interface ISettings {
   mods: ISettingsMods;
   tables: ITableStates;
   update: ISettingsUpdate;
+}
+
+export interface IStateTransactions {
+  transfer: {};
 }
 
 export interface ISessionGameMode {
@@ -264,6 +270,7 @@ export interface IState {
     categories: { [gameId: string]: ICategoryDictionary },
     gameMode: IStateGameMode,
     deployment: { needToDeploy: { [gameId: string]: boolean } },
+    transactions: IStateTransactions,
   };
 }
 

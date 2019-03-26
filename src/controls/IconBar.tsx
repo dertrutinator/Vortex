@@ -5,8 +5,8 @@ import { setdefault } from '../util/util';
 import ActionControl, { IActionControlProps, IActionDefinitionEx } from './ActionControl';
 import Dropdown from './Dropdown';
 import Icon from './Icon';
-import ToolbarIcon from './ToolbarIcon';
 import ToolbarDropdown from './ToolbarDropdown';
+import ToolbarIcon from './ToolbarIcon';
 import { IconButton } from './TooltipControls';
 
 import * as I18next from 'i18next';
@@ -114,7 +114,6 @@ class MenuAction extends React.PureComponent<IMenuActionProps, {}> {
         disabled={action.show !== true}
         title={genTooltip(t, action.show)}
       >
-        {/*this.renderIconInner(icon, index, 'menu')*/}
         <Icon name={action.icon} />
         <div className='button-text'>{t(action.title)}</div>
       </MenuItem>
@@ -164,7 +163,7 @@ class IconBar extends React.Component<IProps, { open: boolean }> {
   }
 
   public render(): JSX.Element {
-    const { actions, collapse, icon, id,
+    const { actions, collapse, icon, id, groupByIcon,
             orientation, className, style } = this.props;
 
     const classes: string[] = [];
@@ -222,17 +221,18 @@ class IconBar extends React.Component<IProps, { open: boolean }> {
         </ButtonGroup>
       );
     } else {
-      const grouped: { [key: string]: IActionDefinition[] } = actions.reduce((prev, action, idx) => {
-        if (action.icon !== undefined) {
-          setdefault(prev, action.icon, []).push(action);
-        } else {
-          prev[idx.toString()] = [action];
-        }
-        return prev;
-      }, {});
+      const grouped: { [key: string]: IActionDefinition[] } =
+        actions.reduce((prev, action, idx) => {
+          if ((action.icon !== undefined) && (groupByIcon !== false)) {
+            setdefault(prev, action.icon, []).push(action);
+          } else {
+            prev[idx.toString()] = [action];
+          }
+          return prev;
+        }, {});
       const byFirstPrio = (lhs: IActionDefinition[], rhs: IActionDefinition[]) => {
         return lhs[0].position - rhs[0].position;
-      }
+      };
       return (
         <ButtonGroup
           id={id}
@@ -323,7 +323,8 @@ class IconBar extends React.Component<IProps, { open: boolean }> {
 
     const instanceIds = typeof(instanceId) === 'string' ? [instanceId] : instanceId;
 
-    const id = `${instanceId || '1'}_${index}`;
+    let actionId = (icon.title || index.toString()).toLowerCase().replace(/ /g, '-');
+    actionId = `action-${actionId}`;
     if (icon.icon !== undefined) {
       // simple case
 
@@ -339,8 +340,8 @@ class IconBar extends React.Component<IProps, { open: boolean }> {
 
       return (
         <ToolbarIcon
-          key={id}
-          id={id}
+          key={actionId}
+          className={actionId}
           instanceId={instanceIds}
           icon={hasIcon ? icon.icon : undefined}
           text={hasText ? t(icon.title) : undefined}
@@ -350,7 +351,7 @@ class IconBar extends React.Component<IProps, { open: boolean }> {
         />
       );
     } else {
-      return this.renderCustomIcon(id, icon);
+      return this.renderCustomIcon(actionId, icon);
     }
   }
 
@@ -391,8 +392,6 @@ class IconBar extends React.Component<IProps, { open: boolean }> {
   private toggleOpen = () => {
     this.setState(update(this.state, {
       open: { $set: !this.state.open },
-      x: { $set: undefined },
-      y: { $set: undefined },
     }));
   }
 

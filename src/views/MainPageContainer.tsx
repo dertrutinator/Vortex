@@ -1,7 +1,8 @@
+import ExtensionGate from '../controls/ExtensionGate';
 import Icon from '../controls/Icon';
 import { IMainPage } from '../types/IMainPage';
 import { ComponentEx, translate } from '../util/ComponentEx';
-import { isOutdated } from '../util/errorHandling';
+import { isOutdated, didIgnoreError } from '../util/errorHandling';
 import { genHash } from '../util/genHash';
 import { log } from '../util/log';
 
@@ -75,7 +76,7 @@ class MainPageContainer extends ComponentEx<IBaseProps, IComponentState> {
             <Icon className='render-failure-icon' name='sad' />
             <div className='render-failure-text'>{t('Failed to render.')}</div>
             <div className='render-failure-buttons'>
-              {isOutdated() ? null : <Button onClick={this.report}>{t('Report')}</Button>}
+              {(isOutdated() || didIgnoreError()) ? null : <Button onClick={this.report}>{t('Report')}</Button>}
               <Button onClick={this.retryRender}>{t('Retry')}</Button>
             </div>
           </Alert>
@@ -90,7 +91,9 @@ class MainPageContainer extends ComponentEx<IBaseProps, IComponentState> {
         <div className={classes.join(' ')}>
           <div className='mainpage-header-container' ref={this.setHeaderRef} />
           <div className='mainpage-body-container'>
-            <page.component active={active} secondary={secondary} {...props} />
+            <ExtensionGate id={page.id}>
+              <page.component active={active} secondary={secondary} {...props} />
+            </ExtensionGate>
           </div>
         </div>
       );

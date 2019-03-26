@@ -326,6 +326,7 @@ div:hover > .hover-expand {
 
 .datetime-filter {
   width: 100%;
+  line-height: 0;
   >div {
     // not sure why this is necessary, without reducing the line-height
     // the input box takes more vertical space than it should but only when there is no content
@@ -390,6 +391,7 @@ div:hover > .hover-expand {
 @import "vortex/table";
 @import "vortex/todo";
 @import "vortex/toggle";
+@import "vortex/usage";
 
 @import "vortex/page-extensions";
 @import "vortex/page-profile";
@@ -403,6 +405,7 @@ div:hover > .hover-expand {
 @import "vortex/dialog-categories";
 @import "vortex/dialog-diagnostic-files";
 @import "vortex/dialog-external-change";
+@import "vortex/dialog-fix-deployment";
 @import "vortex/dialog-fomod";
 @import "vortex/dialog-login";
 
@@ -544,7 +547,6 @@ div:hover > .hover-expand {
 .header-action p {
   width: 100%;
   text-align: center;
-  min-height: 300px;
   display: flex;
   flex-direction: column;
   overflow-y: auto;

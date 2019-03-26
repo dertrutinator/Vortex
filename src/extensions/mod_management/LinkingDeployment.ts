@@ -10,8 +10,8 @@ import {
   IDeployedFile,
   IDeploymentMethod,
   IFileChange,
+  IUnavailableReason,
 } from './types/IDeploymentMethod';
-import {IMod} from './types/IMod';
 
 import * as Promise from 'bluebird';
 import * as I18next from 'i18next';
@@ -39,7 +39,9 @@ interface IDeploymentContext {
  */
 abstract class LinkingActivator implements IDeploymentMethod {
   public static OLD_TAG_NAME = '__delete_if_empty';
-  public static NEW_TAG_NAME = process.platform === 'win32' ? '__folder_managed_by_vortex' : '.__folder_managed_by_vortex';
+  public static NEW_TAG_NAME = process.platform === 'win32'
+    ? '__folder_managed_by_vortex'
+    : '.__folder_managed_by_vortex';
 
   public id: string;
   public name: string;
@@ -52,7 +54,8 @@ abstract class LinkingActivator implements IDeploymentMethod {
   private mQueue: Promise<void> = Promise.resolve();
   private mContext: IDeploymentContext;
 
-  constructor(id: string, name: string, description: string, fallbackPurgeSafe: boolean, api: IExtensionApi) {
+  constructor(id: string, name: string, description: string,
+              fallbackPurgeSafe: boolean, api: IExtensionApi) {
     this.id = id;
     this.name = name;
     this.description = description;
@@ -60,7 +63,7 @@ abstract class LinkingActivator implements IDeploymentMethod {
     this.mApi = api;
   }
 
-  public abstract isSupported(state: any, gameId: string, modTypeId: string): string;
+  public abstract isSupported(state: any, gameId: string, modTypeId: string): IUnavailableReason;
 
   /**
    * if necessary, get user confirmation we should deploy now. Right now this
@@ -107,39 +110,6 @@ abstract class LinkingActivator implements IDeploymentMethod {
       });
   }
 
-  private removeDeployedFile(installationPath: string, dataPath: string, key: string, restoreBackup: boolean): Promise<void> {
-    const outputPath = path.join(
-      dataPath, this.mContext.previousDeployment[key].relPath);
-    const sourcePath = path.join(installationPath,
-      this.mContext.previousDeployment[key].source,
-      this.mContext.previousDeployment[key].relPath);
-    return this.unlinkFile(outputPath, sourcePath)
-      .catch(err => (err.code !== 'ENOENT')
-        // treat an ENOENT error for the unlink as if it was a success.
-        // The end result either way is the link doesn't exist now.
-        ? Promise.reject(err)
-        : Promise.resolve())
-      .then(() => restoreBackup
-        ? fs.renameAsync(outputPath + BACKUP_TAG, outputPath).catch(() => undefined)
-        : Promise.resolve())
-      .then(() => {
-        delete this.mContext.previousDeployment[key];
-      })
-      .catch(err => {
-        log('warn', 'failed to unlink', {
-          path: this.mContext.previousDeployment[key].relPath,
-          error: err.message,
-        });
-        // need to make sure the deployment manifest
-        // reflects the actual state, otherwise we may
-        // leave files orphaned
-        this.mContext.newDeployment[key] =
-          this.mContext.previousDeployment[key];
-
-        return Promise.reject(err);
-      });
-  }
-
   public finalize(gameId: string,
                   dataPath: string,
                   installationPath: string,
@@ -178,18 +148,30 @@ abstract class LinkingActivator implements IDeploymentMethod {
 
     return Promise.map(removed, key =>
         this.removeDeployedFile(installationPath, dataPath, key, true)
-          .catch(() => {
+          .catch(err => {
+            log('warn', 'failed to remove deployed file', {
+              link: this.mContext.newDeployment[key].relPath,
+              error: err.message,
+            });
             ++errorCount;
           }))
       .then(() => Promise.map(sourceChanged, (key: string, idx: number) =>
           this.removeDeployedFile(installationPath, dataPath, key, false)
-          .catch(() => {
+          .catch(err => {
+            log('warn', 'failed to remove deployed file', {
+              link: this.mContext.newDeployment[key].relPath,
+              error: err.message,
+            });
             ++errorCount;
             sourceChanged.splice(idx, 1);
           })))
       .then(() => Promise.map(contentChanged, (key: string, idx: number) =>
           this.removeDeployedFile(installationPath, dataPath, key, false)
-          .catch(() => {
+          .catch(err => {
+            log('warn', 'failed to remove deployed file', {
+              link: this.mContext.newDeployment[key].relPath,
+              error: err.message,
+            });
             ++errorCount;
             contentChanged.splice(idx, 1);
           })))
@@ -246,53 +228,72 @@ abstract class LinkingActivator implements IDeploymentMethod {
         });
   }
 
+  public cancel(gameId: string, dataPath: string, installationPath: string) {
+    if (this.mContext !== undefined) {
+      const context = this.mContext;
+      this.mContext = undefined;
+      context.onComplete();
+    }
+    return Promise.resolve();
+  }
+
   public activate(sourcePath: string, sourceName: string, dataPath: string,
                   blackList: Set<string>): Promise<void> {
+    return fs.statAsync(sourcePath)
+      .then(() => turbowalk(sourcePath, entries => {
+        if (this.mContext === undefined) {
+          return;
+        }
+        entries.forEach(entry => {
+          const relPath: string = path.relative(sourcePath, entry.filePath);
+          const relPathNorm = this.mNormalize(path.join(dataPath, relPath));
+          if (!entry.isDirectory && !blackList.has(relPathNorm)) {
+            // mods are activated in order of ascending priority so
+            // overwriting is fine here
+            this.mContext.newDeployment[relPathNorm] = {
+              relPath,
+              source: sourceName,
+              target: dataPath,
+              time: entry.mtime * 1000,
+            };
+          }
+        });
+      }, { skipHidden: false }))
+      .catch({ code: 'ENOENT' }, () => null);
+  }
+
+  public deactivate(sourcePath: string, dataPath: string): Promise<void> {
     return turbowalk(sourcePath, entries => {
       if (this.mContext === undefined) {
         return;
       }
       entries.forEach(entry => {
-        const relPath: string = path.relative(sourcePath, entry.filePath);
-        const relPathNorm = this.mNormalize(relPath);
-        if (!entry.isDirectory && !blackList.has(relPathNorm)) {
-          // mods are activated in order of ascending priority so
-          // overwriting is fine here
-          this.mContext.newDeployment[relPathNorm] = {
-            relPath,
-            source: sourceName,
-            target: dataPath,
-            time: entry.mtime * 1000,
-          };
-        }
-      });
-    }, { skipHidden: false });
-  }
-
-  public deactivate(installPath: string, dataPath: string,
-                    mod: IMod): Promise<void> {
-    const sourceBase = path.join(installPath, mod.installationPath);
-    return turbowalk(sourceBase, entries => {
-      if (this.mContext === undefined) {
-        return;
-      }
-      entries.forEach(entry => {
         if (!entry.isDirectory) {
-          const relPath: string = path.relative(sourceBase, entry.filePath);
-          delete this.mContext.newDeployment[this.mNormalize(relPath)];
+          const relPath: string = path.relative(sourcePath, entry.filePath);
+          delete this.mContext.newDeployment[this.mNormalize(path.join(dataPath, relPath))];
         }
       });
     });
   }
 
+  public prePurge(): Promise<void> {
+    return Promise.resolve();
+  }
+
   public purge(installPath: string, dataPath: string): Promise<void> {
     if (!truthy(dataPath)) {
-      return Promise.reject(new Error('invalid data path'));
+      // previously we reported an issue here, but we want the ability to have mod types
+      // that don't actually deploy
+      return Promise.resolve();
     }
     // purge
     return this.purgeLinks(installPath, dataPath)
-      .then(() => this.postPurge(dataPath, false))
+      .then(() => this.postLinkPurge(dataPath, false))
       .then(() => undefined);
+  }
+
+  public postPurge(): Promise<void> {
+    return Promise.resolve();
   }
 
   public isActive(): boolean {
@@ -313,15 +314,21 @@ abstract class LinkingActivator implements IDeploymentMethod {
       const fileModPath = [installPath, fileEntry.source, fileEntry.relPath].join(path.sep);
       let sourceDeleted: boolean = false;
       let destDeleted: boolean = false;
+      let sourceTime: Date;
       let destTime: Date;
 
       return this.stat(fileModPath)
         .catch(err => {
           // can't stat source, probably the file was deleted
           sourceDeleted = true;
-          return Promise.resolve();
+          return Promise.resolve(undefined);
         })
-        .then(() => this.statLink(fileDataPath))
+        .then(sourceStats => {
+          if (sourceStats !== undefined) {
+            sourceTime = sourceStats.mtime;
+          }
+          return this.statLink(fileDataPath);
+        })
         .catch(() => {
           // can't stat destination, probably the file was deleted
           destDeleted = true;
@@ -352,6 +359,8 @@ abstract class LinkingActivator implements IDeploymentMethod {
             nonLinks.push({
               filePath: fileEntry.relPath,
               source: fileEntry.source,
+              sourceTime,
+              destTime,
               changeType: 'refchange',
             });
           /* TODO not registering these atm as we have no way to "undo" anyway
@@ -399,6 +408,43 @@ abstract class LinkingActivator implements IDeploymentMethod {
     return fs.lstatAsync(filePath);
   }
 
+  private removeDeployedFile(installationPath: string,
+                             dataPath: string,
+                             key: string,
+                             restoreBackup: boolean): Promise<void> {
+    const outputPath = path.join(dataPath,
+      this.mContext.previousDeployment[key].target || '',
+      this.mContext.previousDeployment[key].relPath);
+    const sourcePath = path.join(installationPath,
+      this.mContext.previousDeployment[key].source,
+      this.mContext.previousDeployment[key].relPath);
+    return this.unlinkFile(outputPath, sourcePath)
+      .catch(err => (err.code !== 'ENOENT')
+        // treat an ENOENT error for the unlink as if it was a success.
+        // The end result either way is the link doesn't exist now.
+        ? Promise.reject(err)
+        : Promise.resolve())
+      .then(() => restoreBackup
+        ? fs.renameAsync(outputPath + BACKUP_TAG, outputPath).catch(() => undefined)
+        : Promise.resolve())
+      .then(() => {
+        delete this.mContext.previousDeployment[key];
+      })
+      .catch(err => {
+        log('warn', 'failed to unlink', {
+          path: this.mContext.previousDeployment[key].relPath,
+          error: err.message,
+        });
+        // need to make sure the deployment manifest
+        // reflects the actual state, otherwise we may
+        // leave files orphaned
+        this.mContext.newDeployment[key] =
+          this.mContext.previousDeployment[key];
+
+        return Promise.reject(err);
+      });
+  }
+
   private deployFile(key: string, installPathStr: string, dataPath: string,
                      replace: boolean): Promise<IDeployedFile> {
     const fullPath =
@@ -442,7 +488,7 @@ abstract class LinkingActivator implements IDeploymentMethod {
     };
   }
 
-  private postPurge(baseDir: string, doRemove: boolean): Promise<boolean> {
+  private postLinkPurge(baseDir: string, doRemove: boolean): Promise<boolean> {
     // recursively go through directories and remove empty ones !if! we encountered a
     // __delete_if_empty file in the hierarchy so far
     let empty = true;
@@ -451,13 +497,13 @@ abstract class LinkingActivator implements IDeploymentMethod {
       doRemove = doRemove ||
         (entries.find(entry =>
           !entry.isDirectory
-          && (   (path.basename(entry.filePath) === LinkingActivator.OLD_TAG_NAME)
-              || (path.basename(entry.filePath) === LinkingActivator.NEW_TAG_NAME))
-          ) !== undefined);
+          && ((path.basename(entry.filePath) === LinkingActivator.OLD_TAG_NAME)
+              || (path.basename(entry.filePath) === LinkingActivator.NEW_TAG_NAME)))
+         !== undefined);
       const dirs = entries.filter(entry => entry.isDirectory);
       // recurse into subdirectories
       queue = queue.then(() =>
-        Promise.each(dirs, dir => this.postPurge(dir.filePath, doRemove)
+        Promise.each(dirs, dir => this.postLinkPurge(dir.filePath, doRemove)
                                     .then(removed => {
                                       if (!removed) { empty = false; }
                                     }))
@@ -480,6 +526,11 @@ abstract class LinkingActivator implements IDeploymentMethod {
           }
         }));
     }, { recurse: false, skipHidden: false })
+      .catch({ code: 'ENOTFOUND' }, err => {
+        // was only able to reproduce this by removing directory manually while purge was happening
+        // still, if the directory doesn't exist, there is nothing to clean up, so - job done?
+        log('error', 'mod directory not found wrapping up deployment', err.message);
+      })
       .then(() => queue)
       .then(() => (empty && doRemove)
         ? fs.statAsync(path.join(baseDir, LinkingActivator.NEW_TAG_NAME))
@@ -507,8 +558,8 @@ abstract class LinkingActivator implements IDeploymentMethod {
         // the purge process for different mod types may come across the same directory if
         // the base directory of one is a parent of the base directory of another
         // (say .../Fallout4 and .../Fallout4/data)
-        // to fix that we'd have to blacklist directories that are the base of another mod type which
-        // would speed this up in general but it feels like a lot can go wrong with that
+        // to fix that we'd have to blacklist directories that are the base of another mod type
+        // which would speed this up in general but it feels like a lot can go wrong with that
         return this.mApi.showDialog('question', 'Confirm', {
           text: 'Are you sure you want to cancel? This will leave backup files '
             + 'unrestored, you will have to clean those up manually.',

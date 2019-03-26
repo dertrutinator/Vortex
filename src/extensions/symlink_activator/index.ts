@@ -2,13 +2,13 @@ import { IExtensionApi, IExtensionContext } from '../../types/IExtensionContext'
 import { IGame } from '../../types/IGame';
 import * as fs from '../../util/fs';
 import { log } from '../../util/log';
-import { activeGameId, gameName } from '../../util/selectors';
+import { activeGameId, gameName, installPathForGame } from '../../util/selectors';
 import walk from '../../util/walk';
 
-import { getGame } from '../gamemode_management/util/getGame';
 import { IDiscoveryResult } from '../gamemode_management/types/IDiscoveryResult';
+import { getGame } from '../gamemode_management/util/getGame';
 import LinkingDeployment from '../mod_management/LinkingDeployment';
-import { IDeploymentMethod } from '../mod_management/types/IDeploymentMethod';
+import { IDeploymentMethod, IUnavailableReason } from '../mod_management/types/IDeploymentMethod';
 
 import * as Promise from 'bluebird';
 import { app as appIn, remote } from 'electron';
@@ -49,25 +49,25 @@ class DeploymendMethod extends LinkingDeployment {
       + 'your regular account has write access to source and destination.');
   }
 
-  public isSupported(state: any, gameId: string, typeId: string): string {
+  public isSupported(state: any, gameId: string, typeId: string): IUnavailableReason {
     if (gameId === undefined) {
       gameId = activeGameId(state);
     }
-    if (this.isGamebryoGame(gameId)) {
-      // gamebryo engine seems to have some check on FindFirstFile/FindNextFile results that
-      // makes it ignore symbolic links
-      return 'Doesn\'t work with games based on the gamebryo engine '
-        + '(including Skyrim SE and Fallout 4)';
-    }
-    if (this.isUnsupportedGame(gameId)) {
+    if (this.isGamebryoGame(gameId) || this.isUnsupportedGame(gameId)) {
       // Mods for this games use some file types that have issues working with symbolic links
-      return 'Doesn\'t work with ' + gameName(state, gameId);
+      return {
+        description: t => t('Incompatible with "{{name}}".', {
+          replace: {
+            name: gameName(state, gameId),
+          },
+        }),
+      };
     }
 
     const discovery: IDiscoveryResult = state.settings.gameMode.discovered[gameId];
 
     if (discovery === undefined) {
-      return 'No game discovery';
+      return { description: t => t('Game not discovered.') };
     }
 
     const game: IGame = getGame(gameId);
@@ -76,11 +76,28 @@ class DeploymendMethod extends LinkingDeployment {
     try {
       fs.accessSync(modPaths[typeId], fs.constants.W_OK);
       if (!this.ensureAdmin()) {
-        return 'Requires admin rights on windows';
+        return { description: t => t('Requires admin rights on windows.') };
       }
     } catch (err) {
-      return err.message;
+      return { description: t => err.message };
     }
+
+    const installationPath = installPathForGame(state, gameId);
+    const canary = path.join(installationPath, '__vortex_canary.tmp');
+
+    try {
+      fs.writeFileSync(canary, 'Should only exist temporarily, feel free to delete');
+      fs.symlinkSync(canary, canary + '.link');
+    } catch (err) {
+      // EMFILE shouldn't keep us from using hard linking
+      if (err.code !== 'EMFILE') {
+        // the error code we're actually getting is EISDIR, which makes no sense at all
+        return {
+          description: t => t('Filesystem doesn\'t support hard links.'),
+        };
+      }
+    }
+
     return undefined;
   }
 
@@ -159,13 +176,17 @@ class DeploymendMethod extends LinkingDeployment {
 
   private isGamebryoGame(gameId: string): boolean {
     return [
-      'morrowind', 'oblivion', 'skyrim', 'skyrimse', 'skyrimvr',
+      'morrowind', 'oblivion', 'skyrim', 'enderal', 'skyrimse', 'skyrimvr',
       'fallout3', 'fallout4', 'fallout4vr', 'falloutnv',
     ].indexOf(gameId) !== -1;
   }
 
   private isUnsupportedGame(gameId: string): boolean {
-    return ['nomanssky', 'stateofdecay'].indexOf(gameId) !== -1;
+    const unsupportedGames = (process.platform === 'win32')
+      ? ['nomanssky', 'stateofdecay', 'factorio']
+      : ['nomanssky', 'stateofdecay'];
+
+    return unsupportedGames.indexOf(gameId) !== -1;
   }
 }
 

@@ -9,7 +9,6 @@ import * as fs from '../../util/fs';
 import getVortexPath from '../../util/getVortexPath';
 import * as selectors from '../../util/selectors';
 import { getSafe } from '../../util/storeHelper';
-import { spawnSelf } from '../../util/util';
 import MainPage from '../../views/MainPage';
 
 import { IDownload } from '../download_management/types/IDownload';
@@ -210,7 +209,7 @@ class ExtensionManager extends ComponentEx<IProps, IComponentState> {
   }
 
   private restart = () => {
-    spawnSelf(['--wait']);
+    remote.app.relaunch();
     remote.app.exit(0);
   }
 
@@ -241,7 +240,6 @@ class ExtensionManager extends ComponentEx<IProps, IComponentState> {
   private readExtensions() {
     const bundledPath = getVortexPath('bundledPlugins');
     const extensionsPath = path.join(remote.app.getPath('userData'), 'plugins');
-    const extensions: { [extId: string]: IExtension } = {};
 
     let bundledExtensions;
     let dynamicExtensions;
